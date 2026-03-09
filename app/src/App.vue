@@ -69,6 +69,8 @@ const themeState = useThemeSwitcher()
                   :session="consoleState.activeSession.value"
                   :node-name="consoleState.selectedNode.value.name"
                   :node-user="consoleState.selectedNode.value.user"
+                  @terminal-input="consoleState.sendInput"
+                  @resize="consoleState.resizeSession"
                 />
               </SplitterPanel>
               <SplitterPanel class="workbench__side" :size="24" :min-size="18">
@@ -81,6 +83,8 @@ const themeState = useThemeSwitcher()
               :session="consoleState.activeSession.value"
               :node-name="consoleState.selectedNode.value.name"
               :node-user="consoleState.selectedNode.value.user"
+              @terminal-input="consoleState.sendInput"
+              @resize="consoleState.resizeSession"
             />
           </template>
 

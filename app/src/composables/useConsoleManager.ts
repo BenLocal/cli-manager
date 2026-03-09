@@ -1,11 +1,4 @@
-import {
-  computed,
-  onMounted,
-  onUnmounted,
-  reactive,
-  ref,
-  shallowRef,
-} from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, shallowRef } from 'vue'
 import {
   HubConnectionBuilder,
   HubConnectionState,
@@ -83,6 +76,7 @@ export function useConsoleManager() {
   })
 
   onMounted(() => {
+    void loadNodes()
     void ensureHubConnection()
   })
 
@@ -107,6 +101,7 @@ export function useConsoleManager() {
   function selectNode(nodeId: string) {
     selectedNodeId.value = nodeId
     viewMode.value = 'terminal'
+    void loadSessions(nodeId)
   }
 
   function openSessionDialog(sessionId?: string) {
@@ -119,8 +114,21 @@ export function useConsoleManager() {
   async function saveSession(payload: SessionCreatePayload) {
     if (!selectedNode.value) return
     if (sessionDialogMode.value === 'edit') {
-      const session = nodeSessions[selectedNode.value.id]?.sessions.find((item) => item.id === editingSessionId.value)
+      const session = nodeSessions[selectedNode.value.id]?.sessions.find(
+        (item) => item.id === editingSessionId.value,
+      )
       if (!session) return
+      const response = await fetch(`/api/sessions/${session.id}/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: payload.process,
+          workspace: payload.workspace,
+        }),
+      })
+      if (!response.ok) {
+        throw new Error('update session failed')
+      }
       session.name = payload.process
       session.workspace = payload.workspace
       session.files = createWorkspaceTree(payload.workspace)
@@ -187,6 +195,9 @@ export function useConsoleManager() {
         const connection = await ensureHubConnection()
         await connection.invoke('CloseSession', sessionId)
       }
+      if (!sessionId.startsWith('pending-')) {
+        await fetch(`/api/sessions/${sessionId}/delete`, { method: 'POST' })
+      }
     } catch (error) {
       console.error('close session failed', error)
     }
@@ -195,60 +206,161 @@ export function useConsoleManager() {
   }
 
   function addNode(payload: NewNodePayload) {
-    const nodeId = `node-${Date.now()}`
-    const node: NodeItem = {
-      id: nodeId,
-      name: payload.name,
-      ip: payload.ip,
-      port: payload.port,
-      user: payload.user,
-      password: payload.password,
-      status: 'online',
-      cpu: '0%',
-      memory: '0GB',
-      type: 'Worker',
-      defaultProcess: 'bash',
-      defaultWorkspace: '/root',
-    }
-
-    nodes.value.unshift(node)
-    nodeSessions[nodeId] = {
-      activeSessionId: '',
-      sessions: [],
-    }
-    selectNode(nodeId)
+    void createNode(payload)
   }
 
   function updateNode(nodeId: string, payload: NewNodePayload) {
-    const node = nodes.value.find((item) => item.id === nodeId)
-    if (!node) return
-    node.name = payload.name
-    node.ip = payload.ip
-    node.port = payload.port
-    node.user = payload.user
-    node.password = payload.password
+    void saveNode(nodeId, payload)
   }
 
   function deleteNode(nodeId: string) {
-    const index = nodes.value.findIndex((item) => item.id === nodeId)
-    if (index === -1) return
-    nodes.value.splice(index, 1)
-    delete nodeSessions[nodeId]
-
-    if (selectedNodeId.value === nodeId) {
-      selectedNodeId.value = nodes.value[0]?.id ?? ''
-    }
+    void removeNode(nodeId)
   }
 
-  async function submitCommand(command: string) {
+  async function sendInput(data: string) {
     const session = activeSession.value
     if (!session || session.status !== 'live') return
 
     try {
       const connection = await ensureHubConnection()
-      await connection.invoke('Input', session.id, `${command}\n`)
+      await connection.invoke('Input', session.id, data)
     } catch (error) {
-      console.error('submit command failed', error)
+      console.error('submit input failed', error)
+    }
+  }
+
+  async function resizeSession(payload: { cols: number; rows: number }) {
+    const session = activeSession.value
+    if (!session || session.status !== 'live') return
+    if (payload.cols < 1 || payload.rows < 1) return
+
+    try {
+      const connection = await ensureHubConnection()
+      await connection.invoke('Resize', session.id, payload.cols, payload.rows)
+    } catch (error) {
+      console.error('resize session failed', error)
+    }
+  }
+
+  async function loadNodes() {
+    const response = await fetch('/api/nodes')
+    if (!response.ok) {
+      throw new Error('load nodes failed')
+    }
+
+    const data = (await response.json()) as NodeItem[]
+    nodes.value = data
+    for (const node of data) {
+      ensureNodeState(node.id)
+    }
+
+    if (!selectedNodeId.value || !data.find((node) => node.id === selectedNodeId.value)) {
+      selectedNodeId.value = data[0]?.id ?? ''
+    }
+
+    if (selectedNodeId.value) {
+      await loadSessions(selectedNodeId.value)
+    }
+  }
+
+  async function loadSessions(nodeId: string) {
+    const response = await fetch(`/api/nodes/${nodeId}/sessions`)
+    if (!response.ok) {
+      throw new Error('load sessions failed')
+    }
+
+    const payload = (await response.json()) as Array<{
+      id: string
+      nodeId: string
+      name: string
+      workspace: string
+      status: string
+      createdAt: string
+    }>
+
+    const nodeState = ensureNodeState(nodeId)
+    const previous = new Map(nodeState.sessions.map((session) => [session.id, session]))
+    const mapped = payload.map((item) => {
+      const existing = previous.get(item.id)
+      if (existing) {
+        existing.name = item.name
+        existing.workspace = item.workspace
+        existing.files = createWorkspaceTree(item.workspace)
+        existing.status = item.status as SessionItem['status']
+        return existing
+      }
+
+      return {
+        id: item.id,
+        name: item.name,
+        workspace: item.workspace,
+        createdAt: item.createdAt,
+        history: ['[SYSTEM] 会话记录已从 SQLite 加载'],
+        files: createWorkspaceTree(item.workspace),
+        status: item.status as SessionItem['status'],
+      }
+    })
+
+    for (const session of nodeState.sessions) {
+      if (session.status === 'connecting' && !mapped.find((item) => item.id === session.id)) {
+        mapped.push(session)
+      }
+    }
+
+    nodeState.sessions = mapped
+    nodeState.activeSessionId = mapped[0]?.id ?? ''
+  }
+
+  async function createNode(payload: NewNodePayload) {
+    const response = await fetch('/api/nodes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) {
+      throw new Error('create node failed')
+    }
+
+    const node = (await response.json()) as NodeItem
+    nodes.value.unshift(node)
+    ensureNodeState(node.id)
+    selectNode(node.id)
+  }
+
+  async function saveNode(nodeId: string, payload: NewNodePayload) {
+    const response = await fetch(`/api/nodes/${nodeId}/update`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) {
+      throw new Error('update node failed')
+    }
+
+    const node = (await response.json()) as NodeItem
+    const index = nodes.value.findIndex((item) => item.id === nodeId)
+    if (index !== -1) {
+      nodes.value[index] = node
+    }
+  }
+
+  async function removeNode(nodeId: string) {
+    const response = await fetch(`/api/nodes/${nodeId}/delete`, { method: 'POST' })
+    if (!response.ok) {
+      throw new Error('delete node failed')
+    }
+
+    const index = nodes.value.findIndex((item) => item.id === nodeId)
+    if (index !== -1) {
+      nodes.value.splice(index, 1)
+    }
+    delete nodeSessions[nodeId]
+
+    if (selectedNodeId.value === nodeId) {
+      selectedNodeId.value = nodes.value[0]?.id ?? ''
+      if (selectedNodeId.value) {
+        await loadSessions(selectedNodeId.value)
+      }
     }
   }
 
@@ -372,28 +484,6 @@ export function useConsoleManager() {
     }
   }
 
-  function createDefaultNodeState(node: NodeItem): NodeSessionState {
-    const sessionId = `sess-${node.id}-1`
-    return {
-      activeSessionId: sessionId,
-      sessions: [
-        {
-          id: sessionId,
-          name: node.defaultProcess,
-          workspace: node.defaultWorkspace,
-          createdAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-          history: [
-            `[SYSTEM] 成功连接至节点 ${node.name} (${node.ip})`,
-            `[SYSTEM] 工作目录已切换至: ${node.defaultWorkspace}`,
-            `[EXEC] 正在启动初始化进程: ${node.defaultProcess}...`,
-          ],
-          files: createWorkspaceTree(node.defaultWorkspace),
-          status: 'live',
-        },
-      ],
-    }
-  }
-
   function appendOutput(session: SessionItem, chunk: string) {
     const lines = chunk.replace(/\r/g, '').split('\n')
     for (const line of lines) {
@@ -428,6 +518,7 @@ export function useConsoleManager() {
     addNode,
     updateNode,
     deleteNode,
-    submitCommand,
+    sendInput,
+    resizeSession,
   }
 }

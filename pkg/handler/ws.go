@@ -2,20 +2,20 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/creack/pty"
+	"github.com/benlocal/cli-manager/pkg/db"
 	"github.com/philippseith/signalr"
+	"golang.org/x/crypto/ssh"
 )
 
 type terminalHub struct {
@@ -33,6 +33,7 @@ type terminalSessionManager struct {
 	sessions           map[string]*terminalSession
 	connectionSessions map[string]map[string]struct{}
 	server             signalRServer
+	database           *db.DB
 }
 
 type terminalSession struct {
@@ -42,8 +43,11 @@ type terminalSession struct {
 	process      string
 	workspace    string
 	createdAt    string
-	cmd          *exec.Cmd
-	ptyFile      *os.File
+	client       *ssh.Client
+	session      *ssh.Session
+	stdin        io.WriteCloser
+	stdout       io.Reader
+	stderr       io.Reader
 	closeOnce    sync.Once
 }
 
@@ -73,13 +77,13 @@ type sessionErrorPayload struct {
 	Message   string `json:"message"`
 }
 
-func NewRootHandler() (http.Handler, error) {
+func NewRootHandler(database *db.DB) (http.Handler, error) {
 	uiHandler, err := NewAppHandler()
 	if err != nil {
 		return nil, err
 	}
 
-	manager := newTerminalSessionManager()
+	manager := newTerminalSessionManager(database)
 	server, err := signalr.NewServer(
 		context.Background(),
 		signalr.HubFactory(func() signalr.HubInterface {
@@ -95,14 +99,16 @@ func NewRootHandler() (http.Handler, error) {
 
 	mux := http.NewServeMux()
 	server.MapHTTP(signalr.WithHTTPServeMux(mux), "/hub/terminal")
+	registerNodeRoutes(mux, database)
 	mux.Handle("/", uiHandler)
 	return mux, nil
 }
 
-func newTerminalSessionManager() *terminalSessionManager {
+func newTerminalSessionManager(database *db.DB) *terminalSessionManager {
 	return &terminalSessionManager{
 		sessions:           make(map[string]*terminalSession),
 		connectionSessions: make(map[string]map[string]struct{}),
+		database:           database,
 	}
 }
 
@@ -145,46 +151,104 @@ func (h *terminalHub) sendError(payload sessionErrorPayload) {
 func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, process, workspace string) (sessionCreatedPayload, error) {
 	process = strings.TrimSpace(process)
 	if process == "" {
-		process = defaultShell()
+		process = "bash"
 	}
 
 	workspace = strings.TrimSpace(workspace)
 	if workspace == "" {
-		workspace = defaultWorkspace()
+		workspace = "/root"
 	}
-	workspace = filepath.Clean(workspace)
 
-	info, err := os.Stat(workspace)
+	nodeKey, err := strconv.ParseInt(nodeID, 10, 64)
 	if err != nil {
-		return sessionCreatedPayload{}, fmt.Errorf("workspace unavailable: %w", err)
-	}
-	if !info.IsDir() {
-		return sessionCreatedPayload{}, fmt.Errorf("workspace is not a directory: %s", workspace)
+		return sessionCreatedPayload{}, errors.New("invalid node id")
 	}
 
-	args := strings.Fields(process)
-	if len(args) == 0 {
-		return sessionCreatedPayload{}, errors.New("process is required")
-	}
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Dir = workspace
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-
-	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: 120, Rows: 32})
+	node, err := m.database.GetNode(nodeKey)
 	if err != nil {
-		return sessionCreatedPayload{}, fmt.Errorf("start pty session: %w", err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sessionCreatedPayload{}, errors.New("node not found")
+		}
+		return sessionCreatedPayload{}, err
+	}
+
+	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", node.IP, node.Port), &ssh.ClientConfig{
+		User:            node.User,
+		Auth:            []ssh.AuthMethod{ssh.Password(node.Password)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         8 * time.Second,
+	})
+	if err != nil {
+		return sessionCreatedPayload{}, fmt.Errorf("ssh dial failed: %w", err)
+	}
+
+	sshSession, err := client.NewSession()
+	if err != nil {
+		_ = client.Close()
+		return sessionCreatedPayload{}, fmt.Errorf("ssh session failed: %w", err)
+	}
+
+	if err := sshSession.RequestPty("xterm-256color", 32, 120, ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}); err != nil {
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, fmt.Errorf("request remote pty failed: %w", err)
+	}
+
+	stdin, err := sshSession.StdinPipe()
+	if err != nil {
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, err
+	}
+	stdout, err := sshSession.StdoutPipe()
+	if err != nil {
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, err
+	}
+	stderr, err := sshSession.StderrPipe()
+	if err != nil {
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, err
+	}
+
+	record, err := m.database.CreateSession(db.SessionInput{
+		NodeID:    nodeKey,
+		Name:      process,
+		Workspace: workspace,
+		Status:    db.SessionStatusLive,
+	})
+	if err != nil {
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, err
+	}
+
+	command := fmt.Sprintf("cd %s && exec %s", shellQuote(workspace), process)
+	if err := sshSession.Start(command); err != nil {
+		_ = m.database.SetSessionStatus(record.ID, db.SessionStatusClosed)
+		_ = sshSession.Close()
+		_ = client.Close()
+		return sessionCreatedPayload{}, fmt.Errorf("start remote command failed: %w", err)
 	}
 
 	session := &terminalSession{
-		id:           fmt.Sprintf("sess-%d", time.Now().UnixNano()),
+		id:           strconv.FormatInt(record.ID, 10),
 		nodeID:       nodeID,
 		connectionID: connectionID,
 		process:      process,
 		workspace:    workspace,
-		createdAt:    time.Now().Format("15:04:05"),
-		cmd:          cmd,
-		ptyFile:      ptyFile,
+		createdAt:    record.CreatedAt.Format("15:04:05"),
+		client:       client,
+		session:      sshSession,
+		stdin:        stdin,
+		stdout:       stdout,
+		stderr:       stderr,
 	}
 
 	m.mu.Lock()
@@ -195,7 +259,8 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 	m.connectionSessions[connectionID][session.id] = struct{}{}
 	m.mu.Unlock()
 
-	go m.streamSession(session)
+	go m.streamOutput(session, session.stdout)
+	go m.streamOutput(session, session.stderr)
 	go m.watchSession(session)
 
 	return sessionCreatedPayload{
@@ -208,9 +273,13 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 }
 
 func (m *terminalSessionManager) streamSession(session *terminalSession) {
+	panic("unused")
+}
+
+func (m *terminalSessionManager) streamOutput(session *terminalSession, reader io.Reader) {
 	buffer := make([]byte, 4096)
 	for {
-		n, err := session.ptyFile.Read(buffer)
+		n, err := reader.Read(buffer)
 		if n > 0 {
 			m.emitToConnection(session.connectionID, "SessionOutput", sessionOutputPayload{
 				SessionID: session.id,
@@ -233,8 +302,11 @@ func (m *terminalSessionManager) streamSession(session *terminalSession) {
 
 func (m *terminalSessionManager) watchSession(session *terminalSession) {
 	reason := "session closed"
-	if err := session.cmd.Wait(); err != nil {
+	if err := session.session.Wait(); err != nil {
 		reason = err.Error()
+	}
+	if sessionID, err := strconv.ParseInt(session.id, 10, 64); err == nil {
+		_ = m.database.SetSessionStatus(sessionID, db.SessionStatusClosed)
 	}
 	_ = m.closeSession(session.id, reason, true)
 }
@@ -244,7 +316,7 @@ func (m *terminalSessionManager) write(sessionID, data string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.WriteString(session.ptyFile, data)
+	_, err = io.WriteString(session.stdin, data)
 	return err
 }
 
@@ -253,10 +325,7 @@ func (m *terminalSessionManager) resize(sessionID string, cols, rows int) error 
 	if err != nil {
 		return err
 	}
-	return pty.Setsize(session.ptyFile, &pty.Winsize{
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	})
+	return session.session.WindowChange(rows, cols)
 }
 
 func (m *terminalSessionManager) closeConnection(connectionID string) {
@@ -290,10 +359,9 @@ func (m *terminalSessionManager) closeSession(sessionID, reason string, notify b
 		}
 		m.mu.Unlock()
 
-		_ = session.ptyFile.Close()
-		if session.cmd.Process != nil {
-			_ = session.cmd.Process.Kill()
-		}
+		_ = session.stdin.Close()
+		_ = session.session.Close()
+		_ = session.client.Close()
 
 		if notify {
 			m.emitToConnection(session.connectionID, "SessionClosed", sessionClosedPayload{
@@ -328,19 +396,6 @@ func (m *terminalSessionManager) emitToConnection(connectionID, method string, p
 	server.HubClients().Client(connectionID).Send(method, payload)
 }
 
-func defaultShell() string {
-	if runtime.GOOS == "windows" {
-		return "powershell"
-	}
-	if _, err := exec.LookPath("bash"); err == nil {
-		return "bash"
-	}
-	return "sh"
-}
-
-func defaultWorkspace() string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return home
-	}
-	return "/tmp"
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }

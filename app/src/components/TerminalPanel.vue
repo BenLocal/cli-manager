@@ -13,6 +13,11 @@ const props = defineProps<{
   nodeUser: string
 }>()
 
+const emit = defineEmits<{
+  (event: 'terminal-input', value: string): void
+  (event: 'resize', value: { cols: number; rows: number }): void
+}>()
+
 const terminalHost = ref<HTMLElement | null>(null)
 const fitAddon = new FitAddon()
 let terminal: Terminal | null = null
@@ -52,14 +57,17 @@ function writeHistory(force = false) {
 function fitTerminal() {
   nextTick(() => {
     fitAddon.fit()
+    if (terminal) {
+      emit('resize', { cols: terminal.cols, rows: terminal.rows })
+    }
   })
 }
 
 onMounted(() => {
   terminal = new Terminal({
     convertEol: true,
-    cursorBlink: false,
-    disableStdin: true,
+    cursorBlink: true,
+    disableStdin: false,
     fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
     fontSize: 12,
     lineHeight: 1.55,
@@ -75,6 +83,10 @@ onMounted(() => {
   })
   terminal.loadAddon(fitAddon)
   terminal.open(terminalHost.value!)
+  terminal.onData((data) => {
+    if (props.session.status !== 'live') return
+    emit('terminal-input', data)
+  })
   writeHistory(true)
   fitTerminal()
 
