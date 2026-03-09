@@ -17,25 +17,47 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'select-node', value: string): void
   (event: 'add-node', value: NewNodePayload): void
+  (event: 'update-node', value: { nodeId: string; payload: NewNodePayload }): void
+  (event: 'delete-node', value: string): void
 }>()
 
 const showAddForm = ref(false)
+const editingNodeId = ref('')
 const form = reactive<NewNodePayload>({
   name: '',
   ip: '',
+  port: '22',
   user: '',
-  defaultProcess: 'bash',
-  defaultWorkspace: '/root',
+  password: '',
 })
 
 function submitNode() {
-  if (!form.name || !form.ip || !form.user) return
-  emit('add-node', { ...form })
+  if (!form.name || !form.ip || !form.port || !form.user || !form.password) return
+  if (editingNodeId.value) {
+    emit('update-node', { nodeId: editingNodeId.value, payload: { ...form } })
+  } else {
+    emit('add-node', { ...form })
+  }
+  resetForm()
+}
+
+function startEdit(node: NodeItem) {
+  editingNodeId.value = node.id
+  showAddForm.value = true
+  form.name = node.name
+  form.ip = node.ip
+  form.port = node.port
+  form.user = node.user
+  form.password = node.password
+}
+
+function resetForm() {
+  editingNodeId.value = ''
   form.name = ''
   form.ip = ''
+  form.port = '22'
   form.user = ''
-  form.defaultProcess = 'bash'
-  form.defaultWorkspace = '/root'
+  form.password = ''
   showAddForm.value = false
 }
 
@@ -57,7 +79,7 @@ function statusClass(status: NodeItem['status']) {
           <Button
             rounded
             :icon="showAddForm ? 'pi pi-minus' : 'pi pi-plus'"
-            @click="showAddForm = !showAddForm"
+            @click="showAddForm ? resetForm() : (showAddForm = true)"
           />
         </div>
       </template>
@@ -66,10 +88,10 @@ function statusClass(status: NodeItem['status']) {
         <div v-if="showAddForm" class="add-node-form">
           <InputText v-model="form.name" placeholder="节点名称" />
           <InputText v-model="form.ip" placeholder="IP 地址" />
+          <InputText v-model="form.port" placeholder="端口" />
           <InputText v-model="form.user" placeholder="SSH 用户" />
-          <InputText v-model="form.defaultProcess" placeholder="默认进程" />
-          <InputText v-model="form.defaultWorkspace" placeholder="默认工作区" />
-          <Button label="确认添加" @click="submitNode" />
+          <InputText v-model="form.password" type="password" placeholder="密码" />
+          <Button :label="editingNodeId ? '保存修改' : '确认添加'" @click="submitNode" />
           <Divider />
         </div>
 
@@ -91,9 +113,27 @@ function statusClass(status: NodeItem['status']) {
                     <div class="node-card__head">
                       <div>
                         <h4>{{ node.name }}</h4>
-                        <p>{{ node.user }}@{{ node.ip }}</p>
+                        <p>{{ node.user }}@{{ node.ip }}:{{ node.port }}</p>
                       </div>
-                      <span class="node-card__dot" :class="statusClass(node.status)"></span>
+                      <div class="node-card__actions">
+                        <Button
+                          class="node-card__action"
+                          text
+                          rounded
+                          severity="secondary"
+                          icon="pi pi-pencil"
+                          @click.stop="startEdit(node)"
+                        />
+                        <Button
+                          class="node-card__action node-card__action--danger"
+                          text
+                          rounded
+                          severity="secondary"
+                          icon="pi pi-trash"
+                          @click.stop="emit('delete-node', node.id)"
+                        />
+                        <span class="node-card__dot" :class="statusClass(node.status)"></span>
+                      </div>
                     </div>
                   </button>
                 </template>

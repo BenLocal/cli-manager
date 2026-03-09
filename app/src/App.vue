@@ -1,5 +1,8 @@
 <script setup lang="ts">
+import Button from 'primevue/button'
 import Card from 'primevue/card'
+import Splitter from 'primevue/splitter'
+import SplitterPanel from 'primevue/splitterpanel'
 
 import AppHeader from './components/AppHeader.vue'
 import NodeSidebar from './components/NodeSidebar.vue'
@@ -37,6 +40,8 @@ const themeState = useThemeSwitcher()
         :stats="consoleState.overviewStats.value"
         @select-node="consoleState.selectNode"
         @add-node="consoleState.addNode"
+        @update-node="consoleState.updateNode($event.nodeId, $event.payload)"
+        @delete-node="consoleState.deleteNode"
       />
 
       <section class="app-layout__content">
@@ -52,30 +57,30 @@ const themeState = useThemeSwitcher()
           />
 
           <template v-if="consoleState.viewMode.value === 'terminal'">
-            <div
+            <Splitter
               v-if="consoleState.showWorkspace.value"
               class="workbench"
               :class="{ 'workbench--expanded': !consoleState.showSidebar.value }"
+              :gutter-size="8"
+              layout="horizontal"
             >
-              <div class="workbench__main">
+              <SplitterPanel class="workbench__main" :size="76" :min-size="45">
                 <TerminalPanel
                   :session="consoleState.activeSession.value"
                   :node-name="consoleState.selectedNode.value.name"
                   :node-user="consoleState.selectedNode.value.user"
-                  @submit-command="consoleState.submitCommand"
                 />
-              </div>
-              <div class="workbench__side">
+              </SplitterPanel>
+              <SplitterPanel class="workbench__side" :size="24" :min-size="18">
                 <WorkspaceTree :session="consoleState.activeSession.value" />
-              </div>
-            </div>
+              </SplitterPanel>
+            </Splitter>
 
             <TerminalPanel
               v-else
               :session="consoleState.activeSession.value"
               :node-name="consoleState.selectedNode.value.name"
               :node-user="consoleState.selectedNode.value.user"
-              @submit-command="consoleState.submitCommand"
             />
           </template>
 
@@ -84,7 +89,8 @@ const themeState = useThemeSwitcher()
             :sessions="consoleState.selectedNodeState.value?.sessions ?? []"
             :active-session-id="consoleState.activeSession.value.id"
             @select-session="consoleState.switchSession"
-            @close-session="consoleState.closeSession"
+            @edit-session="consoleState.openSessionDialog"
+            @delete-session="consoleState.deleteSession"
             @create-session="consoleState.openSessionDialog"
           />
         </template>
@@ -100,6 +106,14 @@ const themeState = useThemeSwitcher()
                   : '左侧节点列表和顶部会话入口会在选中节点后激活。'
               }}
             </p>
+            <Button
+              v-if="consoleState.selectedNode.value"
+              class="empty-card__action"
+              rounded
+              icon="pi pi-plus"
+              label="添加会话"
+              @click="() => consoleState.openSessionDialog()"
+            />
           </template>
         </Card>
       </section>
@@ -107,9 +121,10 @@ const themeState = useThemeSwitcher()
 
     <SessionDialog
       v-model:visible="consoleState.showSessionDialog.value"
-      :default-process="consoleState.selectedNode.value?.defaultProcess ?? 'bash'"
-      :default-workspace="consoleState.selectedNode.value?.defaultWorkspace ?? '/root'"
-      @create-session="consoleState.createSession"
+      :mode="consoleState.sessionDialogMode.value"
+      :default-process="consoleState.sessionDialogDefaults.value.process"
+      :default-workspace="consoleState.sessionDialogDefaults.value.workspace"
+      @save-session="consoleState.saveSession"
     />
   </div>
 </template>

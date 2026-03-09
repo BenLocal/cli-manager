@@ -12,7 +12,8 @@ defineProps<{
 
 const emit = defineEmits<{
   (event: 'select-session', value: string): void
-  (event: 'close-session', value: string): void
+  (event: 'edit-session', value: string): void
+  (event: 'delete-session', value: string): void
   (event: 'create-session'): void
 }>()
 </script>
@@ -38,18 +39,27 @@ const emit = defineEmits<{
               <div class="session-grid__body">
                 <h4>{{ session.name }}</h4>
                 <p>{{ session.workspace }}</p>
-                <p>{{ session.status === 'live' ? '在线会话' : '已关闭历史' }}</p>
               </div>
 
-              <Button
-                v-if="sessions.length > 1"
-                class="session-grid__close"
-                text
-                rounded
-                severity="secondary"
-                icon="pi pi-times"
-                @click.stop="emit('close-session', session.id)"
-              />
+              <div class="session-grid__actions">
+                <Button
+                  class="session-grid__action session-grid__action--edit"
+                  text
+                  rounded
+                  severity="secondary"
+                  icon="pi pi-pencil"
+                  @click.stop="emit('edit-session', session.id)"
+                />
+
+                <Button
+                  class="session-grid__action session-grid__action--danger"
+                  text
+                  rounded
+                  severity="secondary"
+                  icon="pi pi-times"
+                  @click.stop="emit('delete-session', session.id)"
+                />
+              </div>
             </template>
           </Card>
 

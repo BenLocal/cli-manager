@@ -10,10 +10,12 @@ export interface NodeItem {
   name: string
   status: NodeStatus
   ip: string
+  port: string
   cpu: string
   memory: string
   type: string
   user: string
+  password: string
   defaultProcess: string
   defaultWorkspace: string
 }
@@ -44,15 +46,17 @@ export interface ConsoleStats {
 export interface NewNodePayload {
   name: string
   ip: string
+  port: string
   user: string
-  defaultProcess: string
-  defaultWorkspace: string
+  password: string
 }
 
 export interface SessionCreatePayload {
   process: string
   workspace: string
 }
+
+export type SessionDialogMode = 'create' | 'edit'
 
 export interface TerminalSessionPayload {
   sessionId: string

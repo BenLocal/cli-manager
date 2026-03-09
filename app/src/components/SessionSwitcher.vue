@@ -27,16 +27,6 @@ const emit = defineEmits<{
       <div class="session-switcher__bar" :class="{ 'session-switcher__bar--full': !sidebarVisible }">
         <div class="session-switcher__tabs">
           <Button
-            v-if="sidebarVisible"
-            class="session-switcher__create-left"
-            text
-            severity="secondary"
-            rounded
-            icon="pi pi-plus"
-            @click="emit('new-session')"
-          />
-
-          <Button
             class="session-switcher__manager"
             :severity="viewMode === 'sessions' ? 'contrast' : 'secondary'"
             icon="pi pi-list"

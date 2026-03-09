@@ -19,6 +19,7 @@ import type {
   NodeItem,
   NodeSessionRecord,
   NodeSessionState,
+  SessionDialogMode,
   SessionItem,
   SessionCreatePayload,
   TerminalClosePayload,
@@ -35,6 +36,8 @@ export function useConsoleManager() {
   const showSidebar = ref(true)
   const showWorkspace = ref(true)
   const showSessionDialog = ref(false)
+  const sessionDialogMode = ref<SessionDialogMode>('create')
+  const editingSessionId = ref('')
   const viewMode = ref<ViewMode>('terminal')
   const hubConnection = shallowRef<HubConnection | null>(null)
   let connectPromise: Promise<void> | null = null
@@ -62,6 +65,23 @@ export function useConsoleManager() {
     ),
   }))
 
+  const sessionDialogDefaults = computed(() => {
+    if (sessionDialogMode.value === 'edit' && selectedNode.value && editingSessionId.value) {
+      const session = nodeSessions[selectedNode.value.id]?.sessions.find((item) => item.id === editingSessionId.value)
+      if (session) {
+        return {
+          process: session.name,
+          workspace: session.workspace,
+        }
+      }
+    }
+
+    return {
+      process: selectedNode.value?.defaultProcess ?? 'bash',
+      workspace: selectedNode.value?.defaultWorkspace ?? '/root',
+    }
+  })
+
   onMounted(() => {
     void ensureHubConnection()
   })
@@ -86,43 +106,59 @@ export function useConsoleManager() {
 
   function selectNode(nodeId: string) {
     selectedNodeId.value = nodeId
-    const node = nodes.value.find((item) => item.id === nodeId)
-    if (node && !nodeSessions[nodeId]) {
-      nodeSessions[nodeId] = {
-        activeSessionId: `sess-${nodeId}-1`,
-        sessions: [
-          {
-            id: `sess-${nodeId}-1`,
-            name: node.defaultProcess,
-            workspace: node.defaultWorkspace,
-            createdAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-            history: [
-              `[SYSTEM] 成功连接至节点 ${node.name} (${node.ip})`,
-              `[SYSTEM] 工作目录已切换至: ${node.defaultWorkspace}`,
-              `[EXEC] 正在启动初始化进程: ${node.defaultProcess}...`,
-            ],
-            files: createWorkspaceTree(node.defaultWorkspace),
-            status: 'live',
-          },
-        ],
-      }
-    }
     viewMode.value = 'terminal'
   }
 
-  function openSessionDialog() {
+  function openSessionDialog(sessionId?: string) {
     if (!selectedNode.value) return
+    sessionDialogMode.value = sessionId ? 'edit' : 'create'
+    editingSessionId.value = sessionId ?? ''
     showSessionDialog.value = true
   }
 
-  async function createSession(payload: SessionCreatePayload) {
+  async function saveSession(payload: SessionCreatePayload) {
     if (!selectedNode.value) return
+    if (sessionDialogMode.value === 'edit') {
+      const session = nodeSessions[selectedNode.value.id]?.sessions.find((item) => item.id === editingSessionId.value)
+      if (!session) return
+      session.name = payload.process
+      session.workspace = payload.workspace
+      session.files = createWorkspaceTree(payload.workspace)
+      showSessionDialog.value = false
+      editingSessionId.value = ''
+      return
+    }
+
+    const nodeId = selectedNode.value.id
+    const nodeState = ensureNodeState(nodeId)
+    const pendingId = `pending-${Date.now()}`
+    nodeState.sessions.push({
+      id: pendingId,
+      name: payload.process,
+      workspace: payload.workspace,
+      createdAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      history: [
+        `[SYSTEM] 正在为节点 ${selectedNode.value.name} 创建会话`,
+        `[SYSTEM] 工作目录准备切换至: ${payload.workspace}`,
+        `[EXEC] 启动进程请求已提交: ${payload.process}`,
+      ],
+      files: createWorkspaceTree(payload.workspace),
+      status: 'connecting',
+    })
+    nodeState.activeSessionId = pendingId
+    showSessionDialog.value = false
+    editingSessionId.value = ''
+    viewMode.value = 'terminal'
+
     try {
       const connection = await ensureHubConnection()
-      await connection.invoke('CreateSession', selectedNode.value.id, payload.process, payload.workspace)
-      showSessionDialog.value = false
-      viewMode.value = 'terminal'
+      await connection.invoke('CreateSession', nodeId, payload.process, payload.workspace)
     } catch (error) {
+      const pending = nodeState.sessions.find((item) => item.id === pendingId)
+      if (pending) {
+        pending.status = 'closed'
+        pending.history.push('[SYSTEM] 会话创建失败，已切换为本地占位状态')
+      }
       console.error('create session failed', error)
     }
   }
@@ -135,7 +171,7 @@ export function useConsoleManager() {
     viewMode.value = 'terminal'
   }
 
-  async function closeSession(sessionId: string) {
+  async function deleteSession(sessionId: string) {
     if (!selectedNode.value) return
     const nodeState = nodeSessions[selectedNode.value.id]
     if (!nodeState) return
@@ -146,21 +182,16 @@ export function useConsoleManager() {
     const session = nodeState.sessions[index]
     if (!session) return
 
-    if (session.status === 'closed') {
-      nodeState.sessions.splice(index, 1)
-      if (nodeState.activeSessionId === sessionId) {
-        const fallback = nodeState.sessions[Math.max(index - 1, 0)]
-        nodeState.activeSessionId = fallback?.id ?? ''
-      }
-      return
-    }
-
     try {
-      const connection = await ensureHubConnection()
-      await connection.invoke('CloseSession', sessionId)
+      if (session.status !== 'closed') {
+        const connection = await ensureHubConnection()
+        await connection.invoke('CloseSession', sessionId)
+      }
     } catch (error) {
       console.error('close session failed', error)
     }
+
+    removeSession(nodeState, sessionId, index)
   }
 
   function addNode(payload: NewNodePayload) {
@@ -169,17 +200,44 @@ export function useConsoleManager() {
       id: nodeId,
       name: payload.name,
       ip: payload.ip,
+      port: payload.port,
       user: payload.user,
+      password: payload.password,
       status: 'online',
       cpu: '0%',
       memory: '0GB',
       type: 'Worker',
-      defaultProcess: payload.defaultProcess,
-      defaultWorkspace: payload.defaultWorkspace,
+      defaultProcess: 'bash',
+      defaultWorkspace: '/root',
     }
 
     nodes.value.unshift(node)
+    nodeSessions[nodeId] = {
+      activeSessionId: '',
+      sessions: [],
+    }
     selectNode(nodeId)
+  }
+
+  function updateNode(nodeId: string, payload: NewNodePayload) {
+    const node = nodes.value.find((item) => item.id === nodeId)
+    if (!node) return
+    node.name = payload.name
+    node.ip = payload.ip
+    node.port = payload.port
+    node.user = payload.user
+    node.password = payload.password
+  }
+
+  function deleteNode(nodeId: string) {
+    const index = nodes.value.findIndex((item) => item.id === nodeId)
+    if (index === -1) return
+    nodes.value.splice(index, 1)
+    delete nodeSessions[nodeId]
+
+    if (selectedNodeId.value === nodeId) {
+      selectedNodeId.value = nodes.value[0]?.id ?? ''
+    }
   }
 
   async function submitCommand(command: string) {
@@ -230,10 +288,25 @@ export function useConsoleManager() {
   function registerHubCallbacks(connection: HubConnection) {
     connection.on('SessionCreated', (payload: TerminalSessionPayload) => {
       const nodeState = ensureNodeState(payload.nodeId)
-      const existing = nodeState.sessions.find((session) => session.id === payload.sessionId)
+      const existing =
+        nodeState.sessions.find((session) => session.id === payload.sessionId) ??
+        nodeState.sessions.find(
+          (session) =>
+            session.status === 'connecting' &&
+            session.name === payload.process &&
+            session.workspace === payload.workspace,
+        )
       if (existing) {
+        existing.id = payload.sessionId
         existing.name = payload.process
         existing.workspace = payload.workspace
+        existing.createdAt = payload.createdAt
+        existing.files = createWorkspaceTree(payload.workspace)
+        existing.history = [
+          `[SYSTEM] 成功连接至会话 ${payload.sessionId}`,
+          `[SYSTEM] 工作目录已切换至: ${payload.workspace}`,
+          `[EXEC] 初始化进程已启动: ${payload.process}`,
+        ]
         existing.status = 'live'
       } else {
         nodeState.sessions.push({
@@ -288,6 +361,39 @@ export function useConsoleManager() {
     return nodeState?.sessions.find((session) => session.id === sessionId) ?? null
   }
 
+  function removeSession(nodeState: NodeSessionState, sessionId: string, knownIndex?: number) {
+    const index = knownIndex ?? nodeState.sessions.findIndex((session) => session.id === sessionId)
+    if (index === -1) return
+    nodeState.sessions.splice(index, 1)
+
+    if (nodeState.activeSessionId === sessionId) {
+      const fallback = nodeState.sessions[Math.max(index - 1, 0)] ?? nodeState.sessions[0]
+      nodeState.activeSessionId = fallback?.id ?? ''
+    }
+  }
+
+  function createDefaultNodeState(node: NodeItem): NodeSessionState {
+    const sessionId = `sess-${node.id}-1`
+    return {
+      activeSessionId: sessionId,
+      sessions: [
+        {
+          id: sessionId,
+          name: node.defaultProcess,
+          workspace: node.defaultWorkspace,
+          createdAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          history: [
+            `[SYSTEM] 成功连接至节点 ${node.name} (${node.ip})`,
+            `[SYSTEM] 工作目录已切换至: ${node.defaultWorkspace}`,
+            `[EXEC] 正在启动初始化进程: ${node.defaultProcess}...`,
+          ],
+          files: createWorkspaceTree(node.defaultWorkspace),
+          status: 'live',
+        },
+      ],
+    }
+  }
+
   function appendOutput(session: SessionItem, chunk: string) {
     const lines = chunk.replace(/\r/g, '').split('\n')
     for (const line of lines) {
@@ -310,14 +416,18 @@ export function useConsoleManager() {
     showSidebar,
     showWorkspace,
     showSessionDialog,
+    sessionDialogMode,
+    sessionDialogDefaults,
     viewMode,
     overviewStats,
     selectNode,
     openSessionDialog,
-    createSession,
+    saveSession,
     switchSession,
-    closeSession,
+    deleteSession,
     addNode,
+    updateNode,
+    deleteNode,
     submitCommand,
   }
 }

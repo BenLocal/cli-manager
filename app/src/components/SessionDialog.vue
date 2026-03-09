@@ -4,16 +4,18 @@ import Dialog from 'primevue/dialog'
 import FloatLabel from 'primevue/floatlabel'
 import InputText from 'primevue/inputtext'
 import { reactive, watch } from 'vue'
+import type { SessionDialogMode } from '../types/console'
 
 const props = defineProps<{
   visible: boolean
+  mode: SessionDialogMode
   defaultProcess: string
   defaultWorkspace: string
 }>()
 
 const emit = defineEmits<{
   (event: 'update:visible', value: boolean): void
-  (event: 'create-session', value: { process: string; workspace: string }): void
+  (event: 'save-session', value: { process: string; workspace: string }): void
 }>()
 
 const form = reactive({
@@ -37,7 +39,7 @@ function close() {
 
 function submit() {
   if (!form.process || !form.workspace) return
-  emit('create-session', { process: form.process, workspace: form.workspace })
+  emit('save-session', { process: form.process, workspace: form.workspace })
 }
 </script>
 
@@ -45,7 +47,7 @@ function submit() {
   <Dialog
     :visible="visible"
     modal
-    header="初始化新会话"
+    :header="mode === 'edit' ? '编辑会话' : '初始化新会话'"
     :style="{ width: 'min(92vw, 34rem)' }"
     @update:visible="emit('update:visible', $event)"
   >
@@ -62,7 +64,7 @@ function submit() {
 
       <div class="session-dialog__actions">
         <Button label="取消" text severity="secondary" @click="close" />
-        <Button label="启动会话" icon="pi pi-play" @click="submit" />
+        <Button :label="mode === 'edit' ? '保存修改' : '启动会话'" :icon="mode === 'edit' ? 'pi pi-check' : 'pi pi-play'" @click="submit" />
       </div>
     </div>
   </Dialog>

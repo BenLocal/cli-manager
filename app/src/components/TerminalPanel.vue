@@ -1,11 +1,9 @@
 <script setup lang="ts">
-import Button from 'primevue/button'
 import Card from 'primevue/card'
-import InputGroup from 'primevue/inputgroup'
-import InputGroupAddon from 'primevue/inputgroupaddon'
-import InputText from 'primevue/inputtext'
-import ScrollPanel from 'primevue/scrollpanel'
-import { computed, ref } from 'vue'
+import { FitAddon } from '@xterm/addon-fit'
+import { Terminal } from 'xterm'
+import 'xterm/css/xterm.css'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import type { SessionItem } from '../types/console'
 
@@ -15,25 +13,94 @@ const props = defineProps<{
   nodeUser: string
 }>()
 
-const emit = defineEmits<{
-  (event: 'submit-command', value: string): void
-}>()
+const terminalHost = ref<HTMLElement | null>(null)
+const fitAddon = new FitAddon()
+let terminal: Terminal | null = null
+let resizeObserver: ResizeObserver | null = null
+let renderedSessionId = ''
+let renderedLineCount = 0
 
-const command = ref('')
-const live = computed(() => props.session.status === 'live')
-
-function submit() {
-  const value = command.value.trim()
-  if (!value || !live.value) return
-  emit('submit-command', value)
-  command.value = ''
+function colorize(line: string) {
+  if (line.startsWith('[SYSTEM]')) return `\u001b[36m${line}\u001b[0m`
+  if (line.startsWith('[EXEC]')) return `\u001b[32m${line}\u001b[0m`
+  return line
 }
 
-function lineClass(line: string) {
-  if (line.startsWith('[SYSTEM]')) return 'terminal-line terminal-line--system'
-  if (line.startsWith('[EXEC]')) return 'terminal-line terminal-line--exec'
-  return 'terminal-line'
+function writeHistory(force = false) {
+  if (!terminal) return
+
+  const sessionChanged = renderedSessionId !== props.session.id
+  const historyShrunk = props.session.history.length < renderedLineCount
+
+  if (force || sessionChanged || historyShrunk) {
+    terminal.reset()
+    renderedSessionId = props.session.id
+    renderedLineCount = 0
+  }
+
+  const nextLines = props.session.history.slice(renderedLineCount)
+  if (!nextLines.length) return
+
+  for (const line of nextLines) {
+    terminal.writeln(colorize(line))
+  }
+
+  renderedLineCount = props.session.history.length
+  terminal.scrollToBottom()
 }
+
+function fitTerminal() {
+  nextTick(() => {
+    fitAddon.fit()
+  })
+}
+
+onMounted(() => {
+  terminal = new Terminal({
+    convertEol: true,
+    cursorBlink: false,
+    disableStdin: true,
+    fontFamily: 'JetBrains Mono, Cascadia Code, Consolas, monospace',
+    fontSize: 12,
+    lineHeight: 1.55,
+    theme: {
+      background: '#020812',
+      foreground: '#d9f4ff',
+      cursor: '#08d2ff',
+      black: '#020812',
+      brightBlack: '#6f8097',
+      cyan: '#05d7ff',
+      green: '#19f3c6',
+    },
+  })
+  terminal.loadAddon(fitAddon)
+  terminal.open(terminalHost.value!)
+  writeHistory(true)
+  fitTerminal()
+
+  resizeObserver = new ResizeObserver(() => {
+    fitTerminal()
+  })
+
+  if (terminalHost.value) {
+    resizeObserver.observe(terminalHost.value)
+  }
+})
+
+onUnmounted(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  terminal?.dispose()
+  terminal = null
+})
+
+watch(
+  () => [props.session.id, props.session.history.length],
+  () => {
+    writeHistory()
+    fitTerminal()
+  },
+)
 </script>
 
 <template>
@@ -46,25 +113,9 @@ function lineClass(line: string) {
     </template>
 
     <template #content>
-      <ScrollPanel class="terminal-card__scroll">
-        <div class="terminal-log">
-          <div v-for="(line, index) in session.history" :key="`${session.id}-${index}`" :class="lineClass(line)">
-            {{ line }}
-          </div>
-        </div>
-      </ScrollPanel>
-
-      <form class="terminal-card__form" @submit.prevent="submit">
-        <InputGroup>
-          <InputGroupAddon>➜</InputGroupAddon>
-          <InputText
-            v-model="command"
-            :disabled="!live"
-            :placeholder="live ? '输入控制指令...' : '当前会话已关闭，无法继续输入'"
-          />
-          <Button icon="pi pi-send" type="submit" :disabled="!live" />
-        </InputGroup>
-      </form>
+      <div class="terminal-card__scroll">
+        <div ref="terminalHost" class="terminal-xterm"></div>
+      </div>
     </template>
   </Card>
 </template>

@@ -34,8 +34,8 @@ const emit = defineEmits<{
 
         <div class="toolbar-brand">
           <div class="toolbar-title">
-            <span>NEXUS</span>
-            <span class="toolbar-title__accent">ENGINE</span>
+            <span>CLI</span>
+            <span class="toolbar-title__accent">MANAGER</span>
           </div>
         </div>
       </div>
