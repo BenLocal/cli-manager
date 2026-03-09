@@ -6,6 +6,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cloudwego/hertz v0.10.4 // indirect
 	github.com/coder/websocket v1.8.13 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/go-kit/log v0.2.1 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/philippseith/signalr v0.8.0 // indirect
