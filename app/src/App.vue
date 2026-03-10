@@ -98,6 +98,7 @@ const themeState = useThemeSwitcher()
             :sessions="consoleState.selectedNodeState.value?.sessions ?? []"
             :active-session-id="consoleState.activeSession.value.id"
             @select-session="consoleState.switchSession"
+            @reconnect-session="consoleState.reconnectSession"
             @edit-session="consoleState.openSessionDialog"
             @delete-session="consoleState.deleteSession"
             @create-session="consoleState.openSessionDialog"

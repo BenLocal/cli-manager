@@ -12,6 +12,7 @@ defineProps<{
 
 const emit = defineEmits<{
   (event: 'select-session', value: string): void
+  (event: 'reconnect-session', value: string): void
   (event: 'edit-session', value: string): void
   (event: 'delete-session', value: string): void
   (event: 'create-session'): void
@@ -42,6 +43,17 @@ const emit = defineEmits<{
               </div>
 
               <div class="session-grid__actions">
+                <Button
+                  class="session-grid__action"
+                  text
+                  rounded
+                  severity="secondary"
+                  icon="pi pi-refresh"
+                  :loading="session.status === 'connecting'"
+                  :disabled="session.status === 'connecting'"
+                  @click.stop="emit('reconnect-session', session.id)"
+                />
+
                 <Button
                   class="session-grid__action session-grid__action--edit"
                   text

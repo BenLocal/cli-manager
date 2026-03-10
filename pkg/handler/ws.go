@@ -36,6 +36,7 @@ type terminalSessionManager struct {
 	mu                 sync.RWMutex
 	sessions           map[string]*terminalSession
 	connectionSessions map[string]map[string]struct{}
+	pendingCloses      map[string]*time.Timer
 	server             signalRServer
 	database           *db.DB
 }
@@ -82,6 +83,8 @@ type sessionErrorPayload struct {
 	Message   string `json:"message"`
 }
 
+type signalRFilterLogger struct{}
+
 func ws(h *chttp.RegistryContext, router *route.Engine) {
 	sp := "/api/hub/terminal"
 	manager := newTerminalSessionManager(h.Database())
@@ -90,10 +93,11 @@ func ws(h *chttp.RegistryContext, router *route.Engine) {
 			return &terminalHub{manager: manager}
 		}),
 		signalr.HTTPTransports(signalr.TransportWebSockets, signalr.TransportServerSentEvents),
-		signalr.KeepAliveInterval(2 * time.Second),
-		signalr.TimeoutInterval(6 * time.Second),
+		signalr.KeepAliveInterval(10 * time.Second),
+		signalr.TimeoutInterval(30 * time.Second),
 		signalr.HandshakeTimeout(15 * time.Second),
 		signalr.InsecureSkipVerify(true),
+		signalr.Logger(signalRFilterLogger{}, false),
 	}
 	server, err := signalr.NewServer(context.Background(), baseOpts...)
 	if err != nil {
@@ -111,16 +115,16 @@ func newTerminalSessionManager(database *db.DB) *terminalSessionManager {
 	return &terminalSessionManager{
 		sessions:           make(map[string]*terminalSession),
 		connectionSessions: make(map[string]map[string]struct{}),
+		pendingCloses:      make(map[string]*time.Timer),
 		database:           database,
 	}
 }
 
 func (h *terminalHub) OnConnected(string) {
-	log.Println("terminal hub connected")
 }
 
 func (h *terminalHub) OnDisconnected(connectionID string) {
-	h.manager.closeConnection(connectionID)
+	h.manager.scheduleConnectionClose(connectionID)
 }
 
 func (h *terminalHub) CreateSession(nodeID, name, process, workspace string) {
@@ -141,6 +145,12 @@ func (h *terminalHub) Input(sessionID, data string) {
 
 func (h *terminalHub) Resize(sessionID string, cols, rows int) {
 	if err := h.manager.resize(sessionID, cols, rows); err != nil {
+		h.sendError(sessionErrorPayload{SessionID: sessionID, Message: err.Error()})
+	}
+}
+
+func (h *terminalHub) ReconnectSession(sessionID string) {
+	if err := h.manager.reattachSession(h.ConnectionID(), sessionID); err != nil {
 		h.sendError(sessionErrorPayload{SessionID: sessionID, Message: err.Error()})
 	}
 }
@@ -260,6 +270,10 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, name, 
 	}
 
 	m.mu.Lock()
+	if timer, ok := m.pendingCloses[session.id]; ok {
+		timer.Stop()
+		delete(m.pendingCloses, session.id)
+	}
 	m.sessions[session.id] = session
 	if _, ok := m.connectionSessions[connectionID]; !ok {
 		m.connectionSessions[connectionID] = make(map[string]struct{})
@@ -278,10 +292,6 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, name, 
 		Workspace: workspace,
 		CreatedAt: session.createdAt,
 	}, nil
-}
-
-func (m *terminalSessionManager) streamSession(session *terminalSession) {
-	panic("unused")
 }
 
 func (m *terminalSessionManager) streamOutput(session *terminalSession, reader io.Reader) {
@@ -356,7 +366,7 @@ func (m *terminalSessionManager) resize(sessionID string, cols, rows int) error 
 	return session.session.WindowChange(rows, cols)
 }
 
-func (m *terminalSessionManager) closeConnection(connectionID string) {
+func (m *terminalSessionManager) scheduleConnectionClose(connectionID string) {
 	m.mu.RLock()
 	sessionSet := m.connectionSessions[connectionID]
 	sessionIDs := make([]string, 0, len(sessionSet))
@@ -366,8 +376,52 @@ func (m *terminalSessionManager) closeConnection(connectionID string) {
 	m.mu.RUnlock()
 
 	for _, sessionID := range sessionIDs {
-		_ = m.closeSession(sessionID, "browser disconnected", false)
+		m.scheduleSessionClose(sessionID, "browser disconnected")
 	}
+}
+
+func (m *terminalSessionManager) scheduleSessionClose(sessionID, reason string) {
+	const disconnectGracePeriod = 20 * time.Second
+
+	m.mu.Lock()
+	if timer, ok := m.pendingCloses[sessionID]; ok {
+		timer.Stop()
+	}
+	m.pendingCloses[sessionID] = time.AfterFunc(disconnectGracePeriod, func() {
+		_ = m.closeSession(sessionID, reason, false)
+	})
+	m.mu.Unlock()
+}
+
+func (m *terminalSessionManager) reattachSession(connectionID, sessionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, ok := m.sessions[sessionID]
+	if !ok {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	if timer, ok := m.pendingCloses[sessionID]; ok {
+		timer.Stop()
+		delete(m.pendingCloses, sessionID)
+	}
+
+	if session.connectionID != "" && session.connectionID != connectionID {
+		if sessionSet, ok := m.connectionSessions[session.connectionID]; ok {
+			delete(sessionSet, sessionID)
+			if len(sessionSet) == 0 {
+				delete(m.connectionSessions, session.connectionID)
+			}
+		}
+	}
+
+	session.connectionID = connectionID
+	if _, ok := m.connectionSessions[connectionID]; !ok {
+		m.connectionSessions[connectionID] = make(map[string]struct{})
+	}
+	m.connectionSessions[connectionID][sessionID] = struct{}{}
+	return nil
 }
 
 func (m *terminalSessionManager) closeSession(sessionID, reason string, notify bool) error {
@@ -378,6 +432,10 @@ func (m *terminalSessionManager) closeSession(sessionID, reason string, notify b
 
 	session.closeOnce.Do(func() {
 		m.mu.Lock()
+		if timer, ok := m.pendingCloses[sessionID]; ok {
+			timer.Stop()
+			delete(m.pendingCloses, sessionID)
+		}
 		delete(m.sessions, sessionID)
 		if sessionSet, ok := m.connectionSessions[session.connectionID]; ok {
 			delete(sessionSet, sessionID)
@@ -427,4 +485,35 @@ func (m *terminalSessionManager) emitToConnection(connectionID, method string, p
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func (signalRFilterLogger) Log(keyVals ...interface{}) error {
+	if shouldIgnoreSignalREvent(keyVals) {
+		return nil
+	}
+	log.Println(keyVals...)
+	return nil
+}
+
+func shouldIgnoreSignalREvent(keyVals []interface{}) bool {
+	for index := 0; index < len(keyVals)-1; index += 2 {
+		key, ok := keyVals[index].(string)
+		if !ok {
+			continue
+		}
+		if key != "error" {
+			continue
+		}
+
+		message := strings.ToLower(fmt.Sprint(keyVals[index+1]))
+		switch {
+		case strings.Contains(message, "failed to read frame header: eof"):
+			return true
+		case strings.Contains(message, "statusgoingaway"):
+			return true
+		case strings.Contains(message, "closed network connection"):
+			return true
+		}
+	}
+	return false
 }

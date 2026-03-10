@@ -16,6 +16,7 @@ import {
   deleteSession as deleteSessionApi,
 } from '../api'
 import { createNodeSessions, initialNodes } from '../data/console'
+import { emitTerminalOutput } from '../utils/terminalStream'
 import type {
   NewNodePayload,
   NodeItem,
@@ -43,6 +44,8 @@ export function useConsoleManager() {
   const viewMode = ref<ViewMode>('terminal')
   const hubConnection = shallowRef<HubConnection | null>(null)
   let connectPromise: Promise<void> | null = null
+  const pendingOutputBuffers = new Map<string, string>()
+  const pendingOutputTimers = new Map<string, number>()
 
   const selectedNode = computed(() => nodes.value.find((node) => node.id === selectedNodeId.value) ?? null)
 
@@ -197,6 +200,7 @@ export function useConsoleManager() {
 
     nodeState.activeSessionId = sessionId
     viewMode.value = 'terminal'
+    session.history.push('[SYSTEM] 正在手动重新连接会话')
     await reconnectStoredSession(selectedNode.value.id, session)
   }
 
@@ -371,8 +375,14 @@ export function useConsoleManager() {
   }
 
   async function ensureHubConnection() {
-    if (hubConnection.value && hubConnection.value.state === HubConnectionState.Connected) {
-      return hubConnection.value
+    const existing = hubConnection.value
+    if (
+      existing &&
+      (existing.state === HubConnectionState.Connected ||
+        existing.state === HubConnectionState.Connecting ||
+        existing.state === HubConnectionState.Reconnecting)
+    ) {
+      return existing
     }
 
     if (connectPromise) {
@@ -381,13 +391,19 @@ export function useConsoleManager() {
       return hubConnection.value
     }
 
-    const connection = new HubConnectionBuilder()
-      .withUrl('/api/hub/terminal')
-      .withAutomaticReconnect()
-      .configureLogging(LogLevel.Warning)
-      .build()
+    const connection =
+      existing && existing.state === HubConnectionState.Disconnected
+        ? existing
+        : new HubConnectionBuilder()
+            .withUrl('/api/hub/terminal')
+            .withAutomaticReconnect()
+            .configureLogging(LogLevel.Warning)
+            .build()
 
-    registerHubCallbacks(connection)
+    if (connection !== existing) {
+      registerHubCallbacks(connection)
+      hubConnection.value = connection
+    }
 
     connectPromise = connection
       .start()
@@ -404,7 +420,23 @@ export function useConsoleManager() {
   }
 
   function registerHubCallbacks(connection: HubConnection) {
+    connection.onreconnecting(() => {
+      forEachRuntimeSession((session) => {
+        session.status = 'connecting'
+        session.history.push('[SYSTEM] SignalR 连接中断，正在尝试恢复')
+      })
+    })
+
+    connection.onreconnected(() => {
+      void reattachRuntimeSessions(connection)
+    })
+
     connection.onclose(() => {
+      forEachRuntimeSession((session) => {
+        session.status = 'closed'
+        session.runtimeSessionId = undefined
+        session.history.push('[SYSTEM] SignalR 连接已关闭，请手动重新连接会话')
+      })
       if (hubConnection.value === connection) {
         hubConnection.value = null
       }
@@ -466,13 +498,13 @@ export function useConsoleManager() {
     connection.on('SessionOutput', (payload: TerminalOutputPayload) => {
       const session = findSession(payload.nodeId, payload.sessionId)
       if (!session) return
-      appendOutput(session, payload.data)
-      session.status = 'live'
+      queueSessionOutput(session, payload.data)
     })
 
     connection.on('SessionClosed', (payload: TerminalClosePayload) => {
       const session = findSession(payload.nodeId, payload.sessionId)
       if (!session) return
+      flushSessionOutput(session)
       session.runtimeSessionId = undefined
       session.status = 'closed'
       if (payload.reason) {
@@ -490,6 +522,38 @@ export function useConsoleManager() {
       }
       console.error('session error', payload.message)
     })
+  }
+
+  function forEachRuntimeSession(visitor: (session: SessionItem) => void) {
+    for (const nodeState of Object.values(nodeSessions)) {
+      for (const session of nodeState.sessions) {
+        if (!session.runtimeSessionId) continue
+        visitor(session)
+      }
+    }
+  }
+
+  async function reattachRuntimeSessions(connection: HubConnection) {
+    const sessions: SessionItem[] = []
+    forEachRuntimeSession((session) => {
+      sessions.push(session)
+    })
+
+    for (const session of sessions) {
+      const runtimeSessionId = session.runtimeSessionId
+      if (!runtimeSessionId) continue
+
+      try {
+        await connection.invoke('ReconnectSession', runtimeSessionId)
+        session.status = 'live'
+        session.history.push('[SYSTEM] SignalR 已恢复，终端会话重新接管成功')
+      } catch (error) {
+        session.status = 'closed'
+        session.runtimeSessionId = undefined
+        session.history.push('[SYSTEM] 终端会话重接管失败，请手动重新连接')
+        console.error('reattach runtime session failed', error)
+      }
+    }
   }
 
   watch(
@@ -526,6 +590,44 @@ export function useConsoleManager() {
     if (session.history.length > 400) {
       session.history.splice(0, session.history.length - 400)
     }
+  }
+
+  function getSessionOutputKey(session: SessionItem) {
+    return session.runtimeSessionId ?? session.id
+  }
+
+  function flushSessionOutput(session: SessionItem) {
+    const key = getSessionOutputKey(session)
+    const timerId = pendingOutputTimers.get(key)
+    if (timerId) {
+      window.clearTimeout(timerId)
+      pendingOutputTimers.delete(key)
+    }
+
+    const buffered = pendingOutputBuffers.get(key)
+    pendingOutputBuffers.delete(key)
+    if (!buffered) return
+
+    appendOutput(session, buffered)
+    session.status = 'live'
+    emitTerminalOutput(session.id, buffered)
+  }
+
+  function queueSessionOutput(session: SessionItem, chunk: string) {
+    const key = getSessionOutputKey(session)
+    const current = pendingOutputBuffers.get(key) ?? ''
+    pendingOutputBuffers.set(key, current + chunk)
+
+    if (pendingOutputTimers.has(key)) {
+      return
+    }
+
+    const timerId = window.setTimeout(() => {
+      pendingOutputTimers.delete(key)
+      flushSessionOutput(session)
+    }, 16)
+
+    pendingOutputTimers.set(key, timerId)
   }
 
   async function reconnectStoredSession(nodeId: string, session: SessionItem) {

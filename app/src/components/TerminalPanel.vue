@@ -6,6 +6,7 @@ import 'xterm/css/xterm.css'
 import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import type { SessionItem } from '../types/console'
+import { subscribeTerminalOutput } from '../utils/terminalStream'
 
 const props = defineProps<{
   session: SessionItem
@@ -27,6 +28,9 @@ let resizeObserver: ResizeObserver | null = null
 let renderedSessionId = ''
 let renderedChunkCount = 0
 let rafId = 0
+let lastResizeKey = ''
+let writeRafId = 0
+let unsubscribeTerminalOutput: (() => void) | null = null
 
 function focusTerminal() {
   terminal?.focus()
@@ -52,21 +56,33 @@ function writeHistory(force = false) {
     terminal.reset()
     renderedSessionId = props.session.id
     renderedChunkCount = 0
+    lastResizeKey = ''
   }
 
   const nextChunks = props.session.history.slice(renderedChunkCount)
   if (!nextChunks.length) return
 
-  for (const chunk of nextChunks) {
-    if (isLocalMessage(chunk)) {
-      terminal.write(colorize(chunk))
-      continue
-    }
-    terminal.write(chunk)
+  const output = nextChunks
+    .filter((chunk) => force || isLocalMessage(chunk) || props.session.status !== 'live')
+    .map((chunk) => (isLocalMessage(chunk) ? colorize(chunk) : chunk))
+    .join('')
+
+  if (output) {
+    terminal.write(output)
   }
 
   renderedChunkCount = props.session.history.length
   terminal.scrollToBottom()
+}
+
+function scheduleWriteHistory(force = false) {
+  if (writeRafId) {
+    cancelAnimationFrame(writeRafId)
+  }
+  writeRafId = requestAnimationFrame(() => {
+    writeRafId = 0
+    writeHistory(force)
+  })
 }
 
 function fitTerminal() {
@@ -78,10 +94,25 @@ function fitTerminal() {
       requestAnimationFrame(() => {
         fitAddon.fit()
         if (terminal) {
+          const resizeKey = `${terminal.cols}x${terminal.rows}`
+          if (resizeKey === lastResizeKey) {
+            return
+          }
+          lastResizeKey = resizeKey
           emit('resize', { cols: terminal.cols, rows: terminal.rows })
         }
       })
     })
+  })
+}
+
+function bindTerminalStream() {
+  unsubscribeTerminalOutput?.()
+  unsubscribeTerminalOutput = subscribeTerminalOutput(props.session.id, (chunk) => {
+    if (!terminal) return
+    terminal.write(chunk)
+    terminal.scrollToBottom()
+    renderedChunkCount = props.session.history.length
   })
 }
 
@@ -103,6 +134,17 @@ onMounted(() => {
       green: '#19f3c6',
     },
   })
+  ;(terminal as Terminal & {
+    attachCustomWheelEventHandler?: (handler: (event: WheelEvent) => boolean) => void
+  }).attachCustomWheelEventHandler?.((event: WheelEvent) => {
+    const viewport = terminalHost.value?.querySelector('.xterm-viewport')
+    if (!viewport) {
+      return false
+    }
+
+    viewport.scrollTop += event.deltaY
+    return false
+  })
   terminal.loadAddon(fitAddon)
   terminal.open(terminalHost.value!)
   terminalHost.value?.addEventListener('click', focusTerminal)
@@ -110,9 +152,10 @@ onMounted(() => {
     if (props.session.status !== 'live') return
     emit('terminal-input', data)
   })
-  writeHistory(true)
+  scheduleWriteHistory(true)
   fitTerminal()
   focusTerminal()
+  bindTerminalStream()
 
   resizeObserver = new ResizeObserver(() => {
     fitTerminal()
@@ -129,6 +172,12 @@ onUnmounted(() => {
     cancelAnimationFrame(rafId)
     rafId = 0
   }
+  if (writeRafId) {
+    cancelAnimationFrame(writeRafId)
+    writeRafId = 0
+  }
+  unsubscribeTerminalOutput?.()
+  unsubscribeTerminalOutput = null
   terminalHost.value?.removeEventListener('click', focusTerminal)
   window.removeEventListener('resize', fitTerminal)
   resizeObserver?.disconnect()
@@ -138,15 +187,24 @@ onUnmounted(() => {
 })
 
 watch(
-  () => [
-    props.session.id,
-    props.session.history.length,
-    props.session.workspace,
-    props.sidebarVisible,
-    props.workspaceVisible,
-  ],
+  () => props.session.id,
   () => {
-    writeHistory()
+    bindTerminalStream()
+    scheduleWriteHistory(true)
+  },
+)
+
+watch(
+  () => props.session.history.length,
+  () => {
+    scheduleWriteHistory()
+  },
+)
+
+watch(
+  () => [props.session.id, props.session.workspace, props.sidebarVisible, props.workspaceVisible],
+  () => {
+    scheduleWriteHistory()
     fitTerminal()
     focusTerminal()
   },
