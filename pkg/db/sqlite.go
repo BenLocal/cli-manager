@@ -58,6 +58,7 @@ type Session struct {
 	ID        int64     `db:"id"`
 	NodeID    int64     `db:"node_id"`
 	Name      string    `db:"name"`
+	Process   string    `db:"process"`
 	Workspace string    `db:"workspace"`
 	Status    int       `db:"status"`
 	CreatedAt time.Time `db:"created_at"`
@@ -75,6 +76,7 @@ type NodeInput struct {
 type SessionInput struct {
 	NodeID    int64
 	Name      string
+	Process   string
 	Workspace string
 	Status    int
 }
@@ -206,7 +208,7 @@ func (db *DB) DeleteNode(id int64) error {
 func (db *DB) ListSessions(nodeID int64) ([]Session, error) {
 	sessions := make([]Session, 0)
 	err := db.sql.Select(&sessions, `
-		SELECT id, node_id, name, workspace, status, created_at, updated_at
+		SELECT id, node_id, name, process, workspace, status, created_at, updated_at
 		FROM session_record
 		WHERE node_id = ?
 		ORDER BY updated_at DESC, id DESC
@@ -220,6 +222,7 @@ func (db *DB) CreateSession(input SessionInput) (Session, error) {
 		ID:        db.nextID(),
 		NodeID:    input.NodeID,
 		Name:      input.Name,
+		Process:   input.Process,
 		Workspace: input.Workspace,
 		Status:    input.Status,
 		CreatedAt: now,
@@ -227,18 +230,18 @@ func (db *DB) CreateSession(input SessionInput) (Session, error) {
 	}
 
 	_, err := db.sql.Exec(
-		`INSERT INTO session_record (id, node_id, name, workspace, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		session.ID, session.NodeID, session.Name, session.Workspace, session.Status, session.CreatedAt, session.UpdatedAt,
+		`INSERT INTO session_record (id, node_id, name, process, workspace, status, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		session.ID, session.NodeID, session.Name, session.Process, session.Workspace, session.Status, session.CreatedAt, session.UpdatedAt,
 	)
 	return session, err
 }
 
-func (db *DB) UpdateSession(id int64, name, workspace string) (Session, error) {
+func (db *DB) UpdateSession(id int64, name, process, workspace string) (Session, error) {
 	now := time.Now()
 	result, err := db.sql.Exec(
-		`UPDATE session_record SET name = ?, workspace = ?, updated_at = ? WHERE id = ?`,
-		name, workspace, now, id,
+		`UPDATE session_record SET name = ?, process = ?, workspace = ?, updated_at = ? WHERE id = ?`,
+		name, process, workspace, now, id,
 	)
 	if err != nil {
 		return Session{}, err
@@ -271,7 +274,7 @@ func (db *DB) DeleteSession(id int64) error {
 func (db *DB) GetSession(id int64) (Session, error) {
 	var session Session
 	err := db.sql.Get(&session, `
-		SELECT id, node_id, name, workspace, status, created_at, updated_at
+		SELECT id, node_id, name, process, workspace, status, created_at, updated_at
 		FROM session_record
 		WHERE id = ?
 	`, id)

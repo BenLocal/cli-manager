@@ -1,4 +1,4 @@
-import { computed, onMounted, onUnmounted, reactive, ref, shallowRef } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
 import {
   HubConnectionBuilder,
   HubConnectionState,
@@ -6,7 +6,16 @@ import {
   type HubConnection,
 } from '@microsoft/signalr'
 
-import { createNodeSessions, createWorkspaceTree, initialNodes } from '../data/console'
+import {
+  createNode as createNodeApi,
+  deleteNode as deleteNodeApi,
+  listNodeSessions,
+  listNodes,
+  updateNode as updateNodeApi,
+  updateSession as updateSessionApi,
+  deleteSession as deleteSessionApi,
+} from '../api'
+import { createNodeSessions, initialNodes } from '../data/console'
 import type {
   NewNodePayload,
   NodeItem,
@@ -63,13 +72,15 @@ export function useConsoleManager() {
       const session = nodeSessions[selectedNode.value.id]?.sessions.find((item) => item.id === editingSessionId.value)
       if (session) {
         return {
-          process: session.name,
+          name: session.name,
+          process: session.process,
           workspace: session.workspace,
         }
       }
     }
 
     return {
+      name: selectedNode.value?.name ? `${selectedNode.value.name} 会话` : '新会话',
       process: selectedNode.value?.defaultProcess ?? 'bash',
       workspace: selectedNode.value?.defaultWorkspace ?? '/root',
     }
@@ -118,20 +129,10 @@ export function useConsoleManager() {
         (item) => item.id === editingSessionId.value,
       )
       if (!session) return
-      const response = await fetch(`/api/sessions/${session.id}/update`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: payload.process,
-          workspace: payload.workspace,
-        }),
-      })
-      if (!response.ok) {
-        throw new Error('update session failed')
-      }
-      session.name = payload.process
+      await updateSessionApi(session.recordId ?? session.id, payload)
+      session.name = payload.name
+      session.process = payload.process
       session.workspace = payload.workspace
-      session.files = createWorkspaceTree(payload.workspace)
       showSessionDialog.value = false
       editingSessionId.value = ''
       return
@@ -142,7 +143,9 @@ export function useConsoleManager() {
     const pendingId = `pending-${Date.now()}`
     nodeState.sessions.push({
       id: pendingId,
-      name: payload.process,
+      runtimeSessionId: undefined,
+      name: payload.name,
+      process: payload.process,
       workspace: payload.workspace,
       createdAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
       history: [
@@ -150,7 +153,6 @@ export function useConsoleManager() {
         `[SYSTEM] 工作目录准备切换至: ${payload.workspace}`,
         `[EXEC] 启动进程请求已提交: ${payload.process}`,
       ],
-      files: createWorkspaceTree(payload.workspace),
       status: 'connecting',
     })
     nodeState.activeSessionId = pendingId
@@ -160,7 +162,7 @@ export function useConsoleManager() {
 
     try {
       const connection = await ensureHubConnection()
-      await connection.invoke('CreateSession', nodeId, payload.process, payload.workspace)
+      await connection.invoke('CreateSession', nodeId, payload.name, payload.process, payload.workspace)
     } catch (error) {
       const pending = nodeState.sessions.find((item) => item.id === pendingId)
       if (pending) {
@@ -177,6 +179,25 @@ export function useConsoleManager() {
     if (!nodeState) return
     nodeState.activeSessionId = sessionId
     viewMode.value = 'terminal'
+    void ensureHubConnection()
+
+    const session = nodeState.sessions.find((item) => item.id === sessionId)
+    if (session) {
+      void reconnectStoredSession(selectedNode.value.id, session)
+    }
+  }
+
+  async function reconnectSession(sessionId: string) {
+    if (!selectedNode.value) return
+    const nodeState = nodeSessions[selectedNode.value.id]
+    if (!nodeState) return
+
+    const session = nodeState.sessions.find((item) => item.id === sessionId)
+    if (!session) return
+
+    nodeState.activeSessionId = sessionId
+    viewMode.value = 'terminal'
+    await reconnectStoredSession(selectedNode.value.id, session)
   }
 
   async function deleteSession(sessionId: string) {
@@ -190,16 +211,23 @@ export function useConsoleManager() {
     const session = nodeState.sessions[index]
     if (!session) return
 
-    try {
-      if (session.status !== 'closed') {
+    if (session.runtimeSessionId) {
+      try {
         const connection = await ensureHubConnection()
-        await connection.invoke('CloseSession', sessionId)
+        await connection.invoke('CloseSession', session.runtimeSessionId)
+      } catch (error) {
+        console.error('close session failed', error)
       }
-      if (!sessionId.startsWith('pending-')) {
-        await fetch(`/api/sessions/${sessionId}/delete`, { method: 'POST' })
+    }
+
+    const recordId = session.recordId ?? (!sessionId.startsWith('pending-') ? sessionId : undefined)
+    if (recordId) {
+      try {
+        await deleteSessionApi(recordId)
+      } catch (error) {
+        console.error('delete session failed', error)
+        return
       }
-    } catch (error) {
-      console.error('close session failed', error)
     }
 
     removeSession(nodeState, sessionId, index)
@@ -219,11 +247,11 @@ export function useConsoleManager() {
 
   async function sendInput(data: string) {
     const session = activeSession.value
-    if (!session || session.status !== 'live') return
+    if (!session || session.status !== 'live' || !session.runtimeSessionId) return
 
     try {
       const connection = await ensureHubConnection()
-      await connection.invoke('Input', session.id, data)
+      await connection.invoke('Input', session.runtimeSessionId, data)
     } catch (error) {
       console.error('submit input failed', error)
     }
@@ -231,24 +259,19 @@ export function useConsoleManager() {
 
   async function resizeSession(payload: { cols: number; rows: number }) {
     const session = activeSession.value
-    if (!session || session.status !== 'live') return
+    if (!session || session.status !== 'live' || !session.runtimeSessionId) return
     if (payload.cols < 1 || payload.rows < 1) return
 
     try {
       const connection = await ensureHubConnection()
-      await connection.invoke('Resize', session.id, payload.cols, payload.rows)
+      await connection.invoke('Resize', session.runtimeSessionId, payload.cols, payload.rows)
     } catch (error) {
       console.error('resize session failed', error)
     }
   }
 
   async function loadNodes() {
-    const response = await fetch('/api/nodes')
-    if (!response.ok) {
-      throw new Error('load nodes failed')
-    }
-
-    const data = (await response.json()) as NodeItem[]
+    const data = (await listNodes()) as NodeItem[]
     nodes.value = data
     for (const node of data) {
       ensureNodeState(node.id)
@@ -264,15 +287,11 @@ export function useConsoleManager() {
   }
 
   async function loadSessions(nodeId: string) {
-    const response = await fetch(`/api/nodes/${nodeId}/sessions`)
-    if (!response.ok) {
-      throw new Error('load sessions failed')
-    }
-
-    const payload = (await response.json()) as Array<{
+    const payload = (await listNodeSessions(nodeId)) as Array<{
       id: string
       nodeId: string
       name: string
+      process: string
       workspace: string
       status: string
       createdAt: string
@@ -280,24 +299,27 @@ export function useConsoleManager() {
 
     const nodeState = ensureNodeState(nodeId)
     const previous = new Map(nodeState.sessions.map((session) => [session.id, session]))
-    const mapped = payload.map((item) => {
+    const mapped: SessionItem[] = payload.map((item) => {
       const existing = previous.get(item.id)
       if (existing) {
+        existing.recordId = item.id
         existing.name = item.name
+        existing.process = item.process
         existing.workspace = item.workspace
-        existing.files = createWorkspaceTree(item.workspace)
-        existing.status = item.status as SessionItem['status']
+        existing.status = existing.runtimeSessionId ? 'live' : 'closed'
         return existing
       }
 
       return {
         id: item.id,
+        recordId: item.id,
+        runtimeSessionId: undefined,
         name: item.name,
+        process: item.process,
         workspace: item.workspace,
         createdAt: item.createdAt,
         history: ['[SYSTEM] 会话记录已从 SQLite 加载'],
-        files: createWorkspaceTree(item.workspace),
-        status: item.status as SessionItem['status'],
+        status: 'closed' as const,
       }
     })
 
@@ -309,35 +331,22 @@ export function useConsoleManager() {
 
     nodeState.sessions = mapped
     nodeState.activeSessionId = mapped[0]?.id ?? ''
+
+    const firstSession = mapped[0]
+    if (viewMode.value === 'terminal' && firstSession) {
+      void reconnectStoredSession(nodeId, firstSession)
+    }
   }
 
   async function createNode(payload: NewNodePayload) {
-    const response = await fetch('/api/nodes', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    if (!response.ok) {
-      throw new Error('create node failed')
-    }
-
-    const node = (await response.json()) as NodeItem
+    const node = (await createNodeApi(payload)) as NodeItem
     nodes.value.unshift(node)
     ensureNodeState(node.id)
     selectNode(node.id)
   }
 
   async function saveNode(nodeId: string, payload: NewNodePayload) {
-    const response = await fetch(`/api/nodes/${nodeId}/update`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    if (!response.ok) {
-      throw new Error('update node failed')
-    }
-
-    const node = (await response.json()) as NodeItem
+    const node = (await updateNodeApi(nodeId, payload)) as NodeItem
     const index = nodes.value.findIndex((item) => item.id === nodeId)
     if (index !== -1) {
       nodes.value[index] = node
@@ -345,10 +354,7 @@ export function useConsoleManager() {
   }
 
   async function removeNode(nodeId: string) {
-    const response = await fetch(`/api/nodes/${nodeId}/delete`, { method: 'POST' })
-    if (!response.ok) {
-      throw new Error('delete node failed')
-    }
+    await deleteNodeApi(nodeId)
 
     const index = nodes.value.findIndex((item) => item.id === nodeId)
     if (index !== -1) {
@@ -376,7 +382,7 @@ export function useConsoleManager() {
     }
 
     const connection = new HubConnectionBuilder()
-      .withUrl('/hub/terminal')
+      .withUrl('/api/hub/terminal')
       .withAutomaticReconnect()
       .configureLogging(LogLevel.Warning)
       .build()
@@ -398,32 +404,50 @@ export function useConsoleManager() {
   }
 
   function registerHubCallbacks(connection: HubConnection) {
+    connection.onclose(() => {
+      if (hubConnection.value === connection) {
+        hubConnection.value = null
+      }
+    })
+
     connection.on('SessionCreated', (payload: TerminalSessionPayload) => {
       const nodeState = ensureNodeState(payload.nodeId)
       const existing =
-        nodeState.sessions.find((session) => session.id === payload.sessionId) ??
+        nodeState.sessions.find((session) => session.runtimeSessionId === payload.sessionId) ??
         nodeState.sessions.find(
           (session) =>
             session.status === 'connecting' &&
-            session.name === payload.process &&
+            session.name === payload.name &&
+            session.process === payload.process &&
             session.workspace === payload.workspace,
         )
       if (existing) {
+        const previousRecordID = existing.recordId
         existing.id = payload.sessionId
-        existing.name = payload.process
+        existing.recordId = payload.sessionId
+        existing.runtimeSessionId = payload.sessionId
+        existing.name = payload.name
+        existing.process = payload.process
         existing.workspace = payload.workspace
         existing.createdAt = payload.createdAt
-        existing.files = createWorkspaceTree(payload.workspace)
         existing.history = [
           `[SYSTEM] 成功连接至会话 ${payload.sessionId}`,
           `[SYSTEM] 工作目录已切换至: ${payload.workspace}`,
           `[EXEC] 初始化进程已启动: ${payload.process}`,
         ]
         existing.status = 'live'
+        if (previousRecordID && previousRecordID !== payload.sessionId) {
+          void deleteSessionApi(previousRecordID).catch((error) => {
+            console.error('cleanup stale session record failed', error)
+          })
+        }
       } else {
         nodeState.sessions.push({
           id: payload.sessionId,
-          name: payload.process,
+          recordId: payload.sessionId,
+          runtimeSessionId: payload.sessionId,
+          name: payload.name,
+          process: payload.process,
           workspace: payload.workspace,
           createdAt: payload.createdAt,
           history: [
@@ -431,7 +455,6 @@ export function useConsoleManager() {
             `[SYSTEM] Workspace set to ${payload.workspace}`,
             `[EXEC] process launched: ${payload.process}`,
           ],
-          files: createWorkspaceTree(payload.workspace),
           status: 'live',
         })
       }
@@ -450,6 +473,7 @@ export function useConsoleManager() {
     connection.on('SessionClosed', (payload: TerminalClosePayload) => {
       const session = findSession(payload.nodeId, payload.sessionId)
       if (!session) return
+      session.runtimeSessionId = undefined
       session.status = 'closed'
       if (payload.reason) {
         session.history.push(`[SYSTEM] ${payload.reason}`)
@@ -468,9 +492,21 @@ export function useConsoleManager() {
     })
   }
 
+  watch(
+    () => [viewMode.value, activeSession.value?.id, activeSession.value?.status] as const,
+    ([mode, sessionId, status]) => {
+      if (mode !== 'terminal' || !sessionId || status !== 'live') return
+      void ensureHubConnection()
+    },
+  )
+
   function findSession(nodeId: string, sessionId: string) {
     const nodeState = nodeSessions[nodeId]
-    return nodeState?.sessions.find((session) => session.id === sessionId) ?? null
+    return (
+      nodeState?.sessions.find(
+        (session) => session.runtimeSessionId === sessionId || session.id === sessionId,
+      ) ?? null
+    )
   }
 
   function removeSession(nodeState: NodeSessionState, sessionId: string, knownIndex?: number) {
@@ -485,14 +521,27 @@ export function useConsoleManager() {
   }
 
   function appendOutput(session: SessionItem, chunk: string) {
-    const lines = chunk.replace(/\r/g, '').split('\n')
-    for (const line of lines) {
-      if (!line) continue
-      session.history.push(line)
-    }
+    session.history.push(chunk)
 
     if (session.history.length > 400) {
       session.history.splice(0, session.history.length - 400)
+    }
+  }
+
+  async function reconnectStoredSession(nodeId: string, session: SessionItem) {
+    if (session.runtimeSessionId || session.status === 'connecting') return
+    if (session.id.startsWith('pending-')) return
+
+    session.status = 'connecting'
+    session.history.push('[SYSTEM] 正在根据历史会话记录重新建立连接')
+
+    try {
+      const connection = await ensureHubConnection()
+      await connection.invoke('CreateSession', nodeId, session.name, session.process, session.workspace)
+    } catch (error) {
+      session.status = 'closed'
+      session.history.push('[SYSTEM] 历史会话自动重连失败')
+      console.error('reconnect stored session failed', error)
     }
   }
 
@@ -514,6 +563,7 @@ export function useConsoleManager() {
     openSessionDialog,
     saveSession,
     switchSession,
+    reconnectSession,
     deleteSession,
     addNode,
     updateNode,

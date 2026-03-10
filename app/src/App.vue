@@ -52,6 +52,7 @@ const themeState = useThemeSwitcher()
             :view-mode="consoleState.viewMode.value"
             :sidebar-visible="consoleState.showSidebar.value"
             @switch-session="consoleState.switchSession"
+            @reconnect-session="consoleState.reconnectSession"
             @update:view-mode="consoleState.viewMode.value = $event"
             @new-session="consoleState.openSessionDialog"
           />
@@ -69,12 +70,14 @@ const themeState = useThemeSwitcher()
                   :session="consoleState.activeSession.value"
                   :node-name="consoleState.selectedNode.value.name"
                   :node-user="consoleState.selectedNode.value.user"
+                  :sidebar-visible="consoleState.showSidebar.value"
+                  :workspace-visible="consoleState.showWorkspace.value"
                   @terminal-input="consoleState.sendInput"
                   @resize="consoleState.resizeSession"
                 />
               </SplitterPanel>
               <SplitterPanel class="workbench__side" :size="24" :min-size="18">
-                <WorkspaceTree :session="consoleState.activeSession.value" />
+                <WorkspaceTree :node-id="consoleState.selectedNode.value.id" :session="consoleState.activeSession.value" />
               </SplitterPanel>
             </Splitter>
 
@@ -83,6 +86,8 @@ const themeState = useThemeSwitcher()
               :session="consoleState.activeSession.value"
               :node-name="consoleState.selectedNode.value.name"
               :node-user="consoleState.selectedNode.value.user"
+              :sidebar-visible="consoleState.showSidebar.value"
+              :workspace-visible="consoleState.showWorkspace.value"
               @terminal-input="consoleState.sendInput"
               @resize="consoleState.resizeSession"
             />
@@ -126,6 +131,7 @@ const themeState = useThemeSwitcher()
     <SessionDialog
       v-model:visible="consoleState.showSessionDialog.value"
       :mode="consoleState.sessionDialogMode.value"
+      :default-name="consoleState.sessionDialogDefaults.value.name"
       :default-process="consoleState.sessionDialogDefaults.value.process"
       :default-workspace="consoleState.sessionDialogDefaults.value.workspace"
       @save-session="consoleState.saveSession"

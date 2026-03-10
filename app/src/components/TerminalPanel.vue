@@ -11,6 +11,8 @@ const props = defineProps<{
   session: SessionItem
   nodeName: string
   nodeUser: string
+  sidebarVisible?: boolean
+  workspaceVisible?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -23,11 +25,20 @@ const fitAddon = new FitAddon()
 let terminal: Terminal | null = null
 let resizeObserver: ResizeObserver | null = null
 let renderedSessionId = ''
-let renderedLineCount = 0
+let renderedChunkCount = 0
+let rafId = 0
+
+function focusTerminal() {
+  terminal?.focus()
+}
+
+function isLocalMessage(chunk: string) {
+  return chunk.startsWith('[SYSTEM]') || chunk.startsWith('[EXEC]')
+}
 
 function colorize(line: string) {
-  if (line.startsWith('[SYSTEM]')) return `\u001b[36m${line}\u001b[0m`
-  if (line.startsWith('[EXEC]')) return `\u001b[32m${line}\u001b[0m`
+  if (line.startsWith('[SYSTEM]')) return `\u001b[36m${line}\u001b[0m\r\n`
+  if (line.startsWith('[EXEC]')) return `\u001b[32m${line}\u001b[0m\r\n`
   return line
 }
 
@@ -35,31 +46,42 @@ function writeHistory(force = false) {
   if (!terminal) return
 
   const sessionChanged = renderedSessionId !== props.session.id
-  const historyShrunk = props.session.history.length < renderedLineCount
+  const historyShrunk = props.session.history.length < renderedChunkCount
 
   if (force || sessionChanged || historyShrunk) {
     terminal.reset()
     renderedSessionId = props.session.id
-    renderedLineCount = 0
+    renderedChunkCount = 0
   }
 
-  const nextLines = props.session.history.slice(renderedLineCount)
-  if (!nextLines.length) return
+  const nextChunks = props.session.history.slice(renderedChunkCount)
+  if (!nextChunks.length) return
 
-  for (const line of nextLines) {
-    terminal.writeln(colorize(line))
+  for (const chunk of nextChunks) {
+    if (isLocalMessage(chunk)) {
+      terminal.write(colorize(chunk))
+      continue
+    }
+    terminal.write(chunk)
   }
 
-  renderedLineCount = props.session.history.length
+  renderedChunkCount = props.session.history.length
   terminal.scrollToBottom()
 }
 
 function fitTerminal() {
   nextTick(() => {
-    fitAddon.fit()
-    if (terminal) {
-      emit('resize', { cols: terminal.cols, rows: terminal.rows })
+    if (rafId) {
+      cancelAnimationFrame(rafId)
     }
+    rafId = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        fitAddon.fit()
+        if (terminal) {
+          emit('resize', { cols: terminal.cols, rows: terminal.rows })
+        }
+      })
+    })
   })
 }
 
@@ -83,12 +105,14 @@ onMounted(() => {
   })
   terminal.loadAddon(fitAddon)
   terminal.open(terminalHost.value!)
+  terminalHost.value?.addEventListener('click', focusTerminal)
   terminal.onData((data) => {
     if (props.session.status !== 'live') return
     emit('terminal-input', data)
   })
   writeHistory(true)
   fitTerminal()
+  focusTerminal()
 
   resizeObserver = new ResizeObserver(() => {
     fitTerminal()
@@ -97,9 +121,16 @@ onMounted(() => {
   if (terminalHost.value) {
     resizeObserver.observe(terminalHost.value)
   }
+  window.addEventListener('resize', fitTerminal)
 })
 
 onUnmounted(() => {
+  if (rafId) {
+    cancelAnimationFrame(rafId)
+    rafId = 0
+  }
+  terminalHost.value?.removeEventListener('click', focusTerminal)
+  window.removeEventListener('resize', fitTerminal)
   resizeObserver?.disconnect()
   resizeObserver = null
   terminal?.dispose()
@@ -107,10 +138,17 @@ onUnmounted(() => {
 })
 
 watch(
-  () => [props.session.id, props.session.history.length],
+  () => [
+    props.session.id,
+    props.session.history.length,
+    props.session.workspace,
+    props.sidebarVisible,
+    props.workspaceVisible,
+  ],
   () => {
     writeHistory()
     fitTerminal()
+    focusTerminal()
   },
 )
 </script>

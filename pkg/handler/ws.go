@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -49,14 +50,15 @@ type terminalSession struct {
 	client       *ssh.Client
 	session      *ssh.Session
 	stdin        io.WriteCloser
-	stdout       io.Reader
-	stderr       io.Reader
+	output       io.Reader
+	outputWriter io.Closer
 	closeOnce    sync.Once
 }
 
 type sessionCreatedPayload struct {
 	SessionID string `json:"sessionId"`
 	NodeID    string `json:"nodeId"`
+	Name      string `json:"name"`
 	Process   string `json:"process"`
 	Workspace string `json:"workspace"`
 	CreatedAt string `json:"createdAt"`
@@ -81,18 +83,23 @@ type sessionErrorPayload struct {
 }
 
 func ws(h *chttp.RegistryContext, router *route.Engine) {
-	sp := "/api/signalr"
+	sp := "/api/hub/terminal"
 	manager := newTerminalSessionManager(h.Database())
-	server, err := signalr.NewServer(
-		context.Background(),
+	baseOpts := []func(signalr.Party) error{
 		signalr.HubFactory(func() signalr.HubInterface {
 			return &terminalHub{manager: manager}
 		}),
-		signalr.HTTPTransports(signalr.TransportWebSockets),
-	)
+		signalr.HTTPTransports(signalr.TransportWebSockets, signalr.TransportServerSentEvents),
+		signalr.KeepAliveInterval(2 * time.Second),
+		signalr.TimeoutInterval(6 * time.Second),
+		signalr.HandshakeTimeout(15 * time.Second),
+		signalr.InsecureSkipVerify(true),
+	}
+	server, err := signalr.NewServer(context.Background(), baseOpts...)
 	if err != nil {
 		panic(err)
 	}
+	manager.server = server
 	mux := http.NewServeMux()
 	server.MapHTTP(signalr.WithHTTPServeMux(mux), sp)
 	handler := adaptor.HertzHandler(mux)
@@ -108,12 +115,16 @@ func newTerminalSessionManager(database *db.DB) *terminalSessionManager {
 	}
 }
 
+func (h *terminalHub) OnConnected(string) {
+	log.Println("terminal hub connected")
+}
+
 func (h *terminalHub) OnDisconnected(connectionID string) {
 	h.manager.closeConnection(connectionID)
 }
 
-func (h *terminalHub) CreateSession(nodeID, process, workspace string) {
-	payload, err := h.manager.createLocalSession(h.ConnectionID(), nodeID, process, workspace)
+func (h *terminalHub) CreateSession(nodeID, name, process, workspace string) {
+	payload, err := h.manager.createLocalSession(h.ConnectionID(), nodeID, name, process, workspace)
 	if err != nil {
 		h.sendError(sessionErrorPayload{NodeID: nodeID, Message: err.Error()})
 		return
@@ -136,6 +147,9 @@ func (h *terminalHub) Resize(sessionID string, cols, rows int) {
 
 func (h *terminalHub) CloseSession(sessionID string) {
 	if err := h.manager.closeSession(sessionID, "session closed by client", true); err != nil {
+		if strings.Contains(err.Error(), "session not found:") {
+			return
+		}
 		h.sendError(sessionErrorPayload{SessionID: sessionID, Message: err.Error()})
 	}
 }
@@ -144,7 +158,12 @@ func (h *terminalHub) sendError(payload sessionErrorPayload) {
 	h.Clients().Caller().Send("SessionError", payload)
 }
 
-func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, process, workspace string) (sessionCreatedPayload, error) {
+func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, name, process, workspace string) (sessionCreatedPayload, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return sessionCreatedPayload{}, errors.New("session name is required")
+	}
+
 	process = strings.TrimSpace(process)
 	if process == "" {
 		process = "bash"
@@ -200,22 +219,14 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 		_ = client.Close()
 		return sessionCreatedPayload{}, err
 	}
-	stdout, err := sshSession.StdoutPipe()
-	if err != nil {
-		_ = sshSession.Close()
-		_ = client.Close()
-		return sessionCreatedPayload{}, err
-	}
-	stderr, err := sshSession.StderrPipe()
-	if err != nil {
-		_ = sshSession.Close()
-		_ = client.Close()
-		return sessionCreatedPayload{}, err
-	}
+	outputReader, outputWriter := io.Pipe()
+	sshSession.Stdout = outputWriter
+	sshSession.Stderr = outputWriter
 
 	record, err := m.database.CreateSession(db.SessionInput{
 		NodeID:    nodeKey,
-		Name:      process,
+		Name:      name,
+		Process:   process,
 		Workspace: workspace,
 		Status:    db.SessionStatusLive,
 	})
@@ -228,6 +239,7 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 	command := fmt.Sprintf("cd %s && exec %s", shellQuote(workspace), process)
 	if err := sshSession.Start(command); err != nil {
 		_ = m.database.SetSessionStatus(record.ID, db.SessionStatusClosed)
+		_ = outputWriter.Close()
 		_ = sshSession.Close()
 		_ = client.Close()
 		return sessionCreatedPayload{}, fmt.Errorf("start remote command failed: %w", err)
@@ -243,8 +255,8 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 		client:       client,
 		session:      sshSession,
 		stdin:        stdin,
-		stdout:       stdout,
-		stderr:       stderr,
+		output:       outputReader,
+		outputWriter: outputWriter,
 	}
 
 	m.mu.Lock()
@@ -255,13 +267,13 @@ func (m *terminalSessionManager) createLocalSession(connectionID, nodeID, proces
 	m.connectionSessions[connectionID][session.id] = struct{}{}
 	m.mu.Unlock()
 
-	go m.streamOutput(session, session.stdout)
-	go m.streamOutput(session, session.stderr)
+	go m.streamOutput(session, session.output)
 	go m.watchSession(session)
 
 	return sessionCreatedPayload{
 		SessionID: session.id,
 		NodeID:    nodeID,
+		Name:      name,
 		Process:   process,
 		Workspace: workspace,
 		CreatedAt: session.createdAt,
@@ -299,12 +311,32 @@ func (m *terminalSessionManager) streamOutput(session *terminalSession, reader i
 func (m *terminalSessionManager) watchSession(session *terminalSession) {
 	reason := "session closed"
 	if err := session.session.Wait(); err != nil {
-		reason = err.Error()
+		reason = formatSessionCloseReason(err)
 	}
 	if sessionID, err := strconv.ParseInt(session.id, 10, 64); err == nil {
 		_ = m.database.SetSessionStatus(sessionID, db.SessionStatusClosed)
 	}
 	_ = m.closeSession(session.id, reason, true)
+}
+
+func formatSessionCloseReason(err error) string {
+	if err == nil {
+		return "session closed"
+	}
+
+	message := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(message)
+
+	switch {
+	case strings.Contains(lower, "exit status"):
+		return "remote process exited"
+	case strings.Contains(lower, "exit signal"):
+		return "remote process terminated by signal"
+	case strings.Contains(lower, "without exit status or exit signal"):
+		return "remote process ended unexpectedly"
+	default:
+		return message
+	}
 }
 
 func (m *terminalSessionManager) write(sessionID, data string) error {
@@ -356,6 +388,7 @@ func (m *terminalSessionManager) closeSession(sessionID, reason string, notify b
 		m.mu.Unlock()
 
 		_ = session.stdin.Close()
+		_ = session.outputWriter.Close()
 		_ = session.session.Close()
 		_ = session.client.Close()
 

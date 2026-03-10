@@ -14,11 +14,14 @@ import (
 //go:embed *.sql
 var files embed.FS
 
-func Run(db *sql.DB) (err error) {
+func Run(db *sql.DB) error {
 	sourceDriver, err := iofs.New(files, ".")
 	if err != nil {
 		return fmt.Errorf("create migration source: %w", err)
 	}
+	defer func() {
+		_ = sourceDriver.Close()
+	}()
 
 	databaseDriver, err := sqlite3.WithInstance(db, &sqlite3.Config{})
 	if err != nil {
@@ -29,12 +32,6 @@ func Run(db *sql.DB) (err error) {
 	if err != nil {
 		return fmt.Errorf("create migrator: %w", err)
 	}
-	defer func() {
-		sourceErr, databaseErr := m.Close()
-		if sourceErr != nil || databaseErr != nil {
-			err = errors.Join(err, sourceErr, databaseErr)
-		}
-	}()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("run migrations: %w", err)

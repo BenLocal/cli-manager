@@ -9,24 +9,27 @@ import type { SessionDialogMode } from '../types/console'
 const props = defineProps<{
   visible: boolean
   mode: SessionDialogMode
+  defaultName: string
   defaultProcess: string
   defaultWorkspace: string
 }>()
 
 const emit = defineEmits<{
   (event: 'update:visible', value: boolean): void
-  (event: 'save-session', value: { process: string; workspace: string }): void
+  (event: 'save-session', value: { name: string; process: string; workspace: string }): void
 }>()
 
 const form = reactive({
+  name: '',
   process: '',
   workspace: '',
 })
 
 watch(
-  () => [props.visible, props.defaultProcess, props.defaultWorkspace] as const,
-  ([visible, process, workspace]) => {
+  () => [props.visible, props.defaultName, props.defaultProcess, props.defaultWorkspace] as const,
+  ([visible, name, process, workspace]) => {
     if (!visible) return
+    form.name = name
     form.process = process
     form.workspace = workspace
   },
@@ -38,8 +41,8 @@ function close() {
 }
 
 function submit() {
-  if (!form.process || !form.workspace) return
-  emit('save-session', { process: form.process, workspace: form.workspace })
+  if (!form.name || !form.process || !form.workspace) return
+  emit('save-session', { name: form.name, process: form.process, workspace: form.workspace })
 }
 </script>
 
@@ -52,6 +55,11 @@ function submit() {
     @update:visible="emit('update:visible', $event)"
   >
     <div class="session-dialog">
+      <FloatLabel variant="in">
+        <InputText id="session-name" v-model="form.name" fluid />
+        <label for="session-name">会话名称</label>
+      </FloatLabel>
+
       <FloatLabel variant="in">
         <InputText id="session-process" v-model="form.process" fluid />
         <label for="session-process">启动进程</label>

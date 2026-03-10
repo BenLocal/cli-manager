@@ -16,6 +16,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'switch-session', value: string): void
+  (event: 'reconnect-session', value: string): void
   (event: 'update:view-mode', value: ViewMode): void
   (event: 'new-session'): void
 }>()
@@ -38,8 +39,20 @@ const emit = defineEmits<{
             <TabList>
               <Tab v-for="session in sessions" :key="session.id" :value="session.id">
                 <span class="session-switcher__tab-label">
-                  <i class="pi pi-angle-right"></i>
-                  {{ session.name }}{{ session.status === 'closed' ? ' · closed' : '' }}
+                  <span class="session-switcher__tab-text">
+                    <i class="pi pi-angle-right"></i>
+                    {{ session.name }}{{ session.status === 'closed' ? ' · closed' : '' }}
+                  </span>
+                  <Button
+                    class="session-switcher__tab-action"
+                    text
+                    rounded
+                    severity="secondary"
+                    icon="pi pi-refresh"
+                    :loading="session.status === 'connecting'"
+                    :disabled="session.status === 'connecting'"
+                    @click.stop="emit('reconnect-session', session.id)"
+                  />
                 </span>
               </Tab>
             </TabList>

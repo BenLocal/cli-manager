@@ -457,6 +457,23 @@ body {
   font-size: 0.74rem;
 }
 
+.session-switcher__tab-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.36rem;
+}
+
+.session-switcher__tab-action {
+  width: 1.55rem;
+  height: 1.55rem;
+  min-width: 1.55rem;
+  color: #8191a8;
+}
+
+.session-switcher__tab-action:hover {
+  color: #16d6ff;
+}
+
 .session-switcher__create-right {
   flex: none;
   width: 2.15rem;

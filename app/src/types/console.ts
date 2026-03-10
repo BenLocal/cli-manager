@@ -22,10 +22,12 @@ export interface NodeItem {
 
 export interface SessionItem {
   id: string
+  recordId?: string
+  runtimeSessionId?: string
   name: string
+  process: string
   workspace: string
   history: string[]
-  files: TreeNode[]
   createdAt: string
   status: SessionStatus
 }
@@ -52,6 +54,7 @@ export interface NewNodePayload {
 }
 
 export interface SessionCreatePayload {
+  name: string
   process: string
   workspace: string
 }
@@ -61,6 +64,7 @@ export type SessionDialogMode = 'create' | 'edit'
 export interface TerminalSessionPayload {
   sessionId: string
   nodeId: string
+  name: string
   process: string
   workspace: string
   createdAt: string

@@ -1,0 +1,25 @@
+@HOST=http://localhost:8082
+
+### Get nodes
+GET {{HOST}}/api/nodes
+
+### Create node
+POST {{HOST}}/api/nodes
+Content-Type: application/json
+
+{
+  "name": "test",
+  "ip": "127.0.0.1",
+  "port": 22,
+  "user": "root",
+  "password": "password"
+}
+
+### Get node by id
+GET {{HOST}}/api/nodes/1
+
+### Update node
+PUT {{HOST}}/api/nodes/1
+Content-Type: application/json
+
+{

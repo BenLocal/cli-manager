@@ -8,6 +8,8 @@ import (
 	"github.com/benlocal/cli-manager/pkg/http"
 
 	hertzServer "github.com/cloudwego/hertz/pkg/app/server"
+
+	_ "github.com/benlocal/cli-manager/pkg/handler"
 )
 
 func main() {
@@ -23,7 +25,7 @@ func main() {
 
 	addr := os.Getenv("APP_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		addr = ":8082"
 	}
 
 	log.Printf("serving embedded app on %s", addr)
@@ -33,7 +35,7 @@ func main() {
 	)
 
 	registry := http.DefaultRegistry
-	registryContext := &http.RegistryContext{}
+	registryContext := http.NewRegistryContext(database)
 	for _, binding := range registry.Bindings() {
 		binding(registryContext, server.Engine)
 	}
