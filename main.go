@@ -2,11 +2,12 @@ package main
 
 import (
 	"log"
-	"net/http"
 	"os"
 
 	"github.com/benlocal/cli-manager/pkg/db"
-	"github.com/benlocal/cli-manager/pkg/handler"
+	"github.com/benlocal/cli-manager/pkg/http"
+
+	hertzServer "github.com/cloudwego/hertz/pkg/app/server"
 )
 
 func main() {
@@ -20,18 +21,22 @@ func main() {
 		}
 	}()
 
-	rootHandler, err := handler.NewRootHandler(database)
-	if err != nil {
-		log.Fatalf("init app handler: %v", err)
-	}
-
 	addr := os.Getenv("APP_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
 
 	log.Printf("serving embedded app on %s", addr)
-	if err := http.ListenAndServe(addr, rootHandler); err != nil {
-		log.Fatalf("serve app: %v", err)
+	server := hertzServer.Default(
+		hertzServer.WithHostPorts(addr),
+		hertzServer.WithMaxRequestBodySize(1*1024*1024*1024), // 1GB
+	)
+
+	registry := http.DefaultRegistry
+	registryContext := &http.RegistryContext{}
+	for _, binding := range registry.Bindings() {
+		binding(registryContext, server.Engine)
 	}
+
+	server.Spin()
 }

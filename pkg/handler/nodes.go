@@ -1,14 +1,18 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/benlocal/cli-manager/pkg/db"
+	chttp "github.com/benlocal/cli-manager/pkg/http"
+	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/cloudwego/hertz/pkg/route"
 )
 
 type nodePayload struct {
@@ -26,182 +30,166 @@ type nodePayload struct {
 	DefaultWorkspace string `json:"defaultWorkspace"`
 }
 
-func registerNodeRoutes(mux *http.ServeMux, database *db.DB) {
-	mux.HandleFunc("/api/nodes", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			handleListNodes(w, database)
-		case http.MethodPost:
-			handleCreateNode(w, r, database)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
+func nodes(h *chttp.RegistryContext, router *route.Engine) {
+	database := h.Database()
+	router.GET("/api/nodes", func(ctx context.Context, c *app.RequestContext) {
+		handleListNodes(c, database)
 	})
-
-	mux.HandleFunc("/api/nodes/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/nodes/"), "/"), "/")
-		if len(parts) == 0 || parts[0] == "" {
-			http.Error(w, "invalid node path", http.StatusBadRequest)
-			return
-		}
-
-		id, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			http.Error(w, "invalid node id", http.StatusBadRequest)
-			return
-		}
-
-		if len(parts) == 2 && parts[1] == "sessions" {
-			if r.Method != http.MethodGet {
-				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-				return
-			}
-			handleListSessions(w, database, id)
-			return
-		}
-
-		if len(parts) == 2 && parts[1] == "update" && r.Method == http.MethodPost {
-			handleUpdateNode(w, r, database, id)
-			return
-		}
-
-		if len(parts) == 2 && parts[1] == "delete" && r.Method == http.MethodPost {
-			handleDeleteNode(w, database, id)
-			return
-		}
-
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	router.POST("/api/nodes", func(ctx context.Context, c *app.RequestContext) {
+		handleCreateNode(c, database)
 	})
-
-	mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/"), "/")
-		if len(parts) != 2 {
-			http.Error(w, "invalid session path", http.StatusBadRequest)
-			return
-		}
-
-		id, err := strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			http.Error(w, "invalid session id", http.StatusBadRequest)
-			return
-		}
-
-		switch {
-		case parts[1] == "update" && r.Method == http.MethodPost:
-			handleUpdateSession(w, r, database, id)
-		case parts[1] == "delete" && r.Method == http.MethodPost:
-			handleDeleteSession(w, database, id)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
+	router.GET("/api/nodes/:id/sessions", func(ctx context.Context, c *app.RequestContext) {
+		handleListSessions(c, database)
+	})
+	router.POST("/api/nodes/:id/update", func(ctx context.Context, c *app.RequestContext) {
+		handleUpdateNode(c, database)
+	})
+	router.POST("/api/nodes/:id/delete", func(ctx context.Context, c *app.RequestContext) {
+		handleDeleteNode(c, database)
+	})
+	router.POST("/api/sessions/:id/update", func(ctx context.Context, c *app.RequestContext) {
+		handleUpdateSession(c, database)
+	})
+	router.POST("/api/sessions/:id/delete", func(ctx context.Context, c *app.RequestContext) {
+		handleDeleteSession(c, database)
 	})
 }
 
-func handleListNodes(w http.ResponseWriter, database *db.DB) {
+func handleListNodes(c *app.RequestContext, database *db.DB) {
 	nodes, err := database.ListNodes()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(c, consts.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, mapNodes(nodes))
+	c.JSON(consts.StatusOK, mapNodes(nodes))
 }
 
-func handleCreateNode(w http.ResponseWriter, r *http.Request, database *db.DB) {
-	input, err := decodeNodeInput(r)
+func handleCreateNode(c *app.RequestContext, database *db.DB) {
+	input, err := decodeNodeInput(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
 	node, err := database.CreateNode(input)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, mapNode(node))
+	c.JSON(consts.StatusCreated, mapNode(node))
 }
 
-func handleUpdateNode(w http.ResponseWriter, r *http.Request, database *db.DB, id int64) {
-	input, err := decodeNodeInput(r)
+func handleUpdateNode(c *app.RequestContext, database *db.DB) {
+	id, err := parsePathID(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(c, consts.StatusBadRequest, "invalid node id")
+		return
+	}
+
+	input, err := decodeNodeInput(c)
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
 	node, err := database.UpdateNode(id, input)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "node not found", http.StatusNotFound)
+			writeError(c, consts.StatusNotFound, "node not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, mapNode(node))
+	c.JSON(consts.StatusOK, mapNode(node))
 }
 
-func handleDeleteNode(w http.ResponseWriter, database *db.DB, id int64) {
+func handleDeleteNode(c *app.RequestContext, database *db.DB) {
+	id, err := parsePathID(c)
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid node id")
+		return
+	}
+
 	if err := database.DeleteNode(id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "node not found", http.StatusNotFound)
+			writeError(c, consts.StatusNotFound, "node not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(c, consts.StatusInternalServerError, err.Error())
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.SetStatusCode(consts.StatusNoContent)
 }
 
-func handleListSessions(w http.ResponseWriter, database *db.DB, nodeID int64) {
+func handleListSessions(c *app.RequestContext, database *db.DB) {
+	nodeID, err := parsePathID(c)
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid node id")
+		return
+	}
+
 	sessions, err := database.ListSessions(nodeID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(c, consts.StatusInternalServerError, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, mapSessions(sessions))
+	c.JSON(consts.StatusOK, mapSessions(sessions))
 }
 
-func handleUpdateSession(w http.ResponseWriter, r *http.Request, database *db.DB, id int64) {
+func handleUpdateSession(c *app.RequestContext, database *db.DB) {
+	id, err := parsePathID(c)
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid session id")
+		return
+	}
+
 	var payload sessionPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := json.Unmarshal(c.Request.Body(), &payload); err != nil {
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
 	session, err := database.UpdateSession(id, strings.TrimSpace(payload.Name), strings.TrimSpace(payload.Workspace))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "session not found", http.StatusNotFound)
+			writeError(c, consts.StatusNotFound, "session not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(c, consts.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, mapSession(session))
+	c.JSON(consts.StatusOK, mapSession(session))
 }
 
-func handleDeleteSession(w http.ResponseWriter, database *db.DB, id int64) {
+func handleDeleteSession(c *app.RequestContext, database *db.DB) {
+	id, err := parsePathID(c)
+	if err != nil {
+		writeError(c, consts.StatusBadRequest, "invalid session id")
+		return
+	}
+
 	if err := database.DeleteSession(id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "session not found", http.StatusNotFound)
+			writeError(c, consts.StatusNotFound, "session not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(c, consts.StatusInternalServerError, err.Error())
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.SetStatusCode(consts.StatusNoContent)
 }
 
-func decodeNodeInput(r *http.Request) (db.NodeInput, error) {
+func decodeNodeInput(c *app.RequestContext) (db.NodeInput, error) {
 	var payload nodePayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(c.Request.Body(), &payload); err != nil {
 		return db.NodeInput{}, err
 	}
 
@@ -233,6 +221,10 @@ type sessionPayload struct {
 	Workspace string `json:"workspace"`
 	Status    string `json:"status"`
 	CreatedAt string `json:"createdAt"`
+}
+
+func parsePathID(c *app.RequestContext) (int64, error) {
+	return strconv.ParseInt(c.Param("id"), 10, 64)
 }
 
 func mapNodes(nodes []db.Node) []nodePayload {
@@ -312,8 +304,8 @@ func mapSessionStatus(status int) string {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+func writeError(c *app.RequestContext, status int, message string) {
+	c.SetStatusCode(status)
+	c.SetContentType("text/plain; charset=utf-8")
+	c.SetBodyString(message)
 }

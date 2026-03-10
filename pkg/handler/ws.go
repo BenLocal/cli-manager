@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/benlocal/cli-manager/pkg/db"
+	chttp "github.com/benlocal/cli-manager/pkg/http"
+	"github.com/cloudwego/hertz/pkg/common/adaptor"
+	"github.com/cloudwego/hertz/pkg/route"
 	"github.com/philippseith/signalr"
 	"golang.org/x/crypto/ssh"
 )
@@ -77,13 +80,9 @@ type sessionErrorPayload struct {
 	Message   string `json:"message"`
 }
 
-func NewRootHandler(database *db.DB) (http.Handler, error) {
-	uiHandler, err := NewAppHandler()
-	if err != nil {
-		return nil, err
-	}
-
-	manager := newTerminalSessionManager(database)
+func ws(h *chttp.RegistryContext, router *route.Engine) {
+	sp := "/api/signalr"
+	manager := newTerminalSessionManager(h.Database())
 	server, err := signalr.NewServer(
 		context.Background(),
 		signalr.HubFactory(func() signalr.HubInterface {
@@ -92,16 +91,13 @@ func NewRootHandler(database *db.DB) (http.Handler, error) {
 		signalr.HTTPTransports(signalr.TransportWebSockets),
 	)
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-
-	manager.server = server
-
 	mux := http.NewServeMux()
-	server.MapHTTP(signalr.WithHTTPServeMux(mux), "/hub/terminal")
-	registerNodeRoutes(mux, database)
-	mux.Handle("/", uiHandler)
-	return mux, nil
+	server.MapHTTP(signalr.WithHTTPServeMux(mux), sp)
+	handler := adaptor.HertzHandler(mux)
+	router.Any(sp, handler)
+	router.Any(sp+"/*wsPath", handler)
 }
 
 func newTerminalSessionManager(database *db.DB) *terminalSessionManager {
